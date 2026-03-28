@@ -405,14 +405,10 @@ if $USE_SHIM; then
     # MOK manager (optional, lets users enrol keys at boot)
     [[ -n "$MM_EFI" ]] && cp "$MM_EFI" "$MNT_ESP/EFI/BOOT/mmx64.efi"
 
-    # Copy GRUB modules so grub.cfg can insmod loopback, iso9660, etc.
-    if [[ -n "$GRUB_MODULES_DIR" ]]; then
-        mkdir -p "$MNT_ESP/boot/grub/x86_64-efi"
-        cp "$GRUB_MODULES_DIR"/*.{mod,lst} "$MNT_ESP/boot/grub/x86_64-efi/" 2>/dev/null || true
-        info "Copied GRUB modules from $GRUB_MODULES_DIR"
-    else
-        warn "GRUB modules directory not found — some grub.cfg features may not work"
-    fi
+    # NOTE: GRUB modules are NOT copied to the ESP. Ubuntu's signed
+    # grubx64.efi has all required modules (loopback, iso9660, linux,
+    # chain, search, regexp, etc.) built in. Loading .mod files from
+    # disk under Secure Boot causes signature-verification errors.
 else
     info "Installing GRUB to ESP (without Secure Boot)..."
     $GRUB_INSTALL \
@@ -437,52 +433,18 @@ else
     cat > "$MNT_ESP/boot/grub/grub.cfg" <<'GRUBEOF'
 set timeout=30
 set default=0
-insmod part_gpt
-insmod fat
-insmod exfat
-insmod ntfs
-insmod loopback
-insmod iso9660
-insmod linux
-insmod chain
-insmod search
-insmod regexp
 
-search --no-floppy --label --set=isopart "LINUXISOS"
-search --no-floppy --label --set=winpart "WIN11"
-
-for file in ($isopart)/isos/*.iso; do
-    if [ ! -e "$file" ]; then break; fi
-    regexp --set=1:isoname '\/isos\/(.+)$' "$file"
-    regexp --set=1:isopath '(\/.*)$' "$file"
-    menuentry "Boot ${isoname}" "$isopath" {
-        loopback loop ($isopart)$1
-        linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=$1 quiet splash ---
-        initrd (loop)/casper/initrd
-    }
-done
-
-menuentry "Windows 11 Installer" {
-    if [ -n "$winpart" ]; then
-        chainloader ($winpart)/efi/boot/bootx64.efi
-    else
-        echo "Windows 11 partition not found."
-        sleep 5
-    fi
+menuentry ">>> Run update-grub.sh to detect ISOs <<<" {
+    echo "No ISOs have been registered yet."
+    echo "Copy .iso files to isos/ on the LINUXISOS partition, then run:"
+    echo "  sudo ./update-grub.sh /dev/sdX"
+    sleep 15
 }
+
+menuentry "UEFI Firmware Settings" { fwsetup }
+menuentry "Reboot" { reboot }
+menuentry "Power Off" { halt }
 GRUBEOF
-fi
-
-# Replace label-based searches with UUID-based searches to avoid matching
-# similarly-labeled internal disks (e.g. another "ESP" or "WIN11").
-sed -i -E \
-    "s#^search --no-floppy --label --set=isopart \"LINUXISOS\"#search --no-floppy --fs-uuid --set=isopart ${ISO_UUID}#" \
-    "$MNT_ESP/boot/grub/grub.cfg"
-
-if [[ -n "$WIN_UUID" ]]; then
-    sed -i -E \
-        "s#^search --no-floppy --label --set=winpart \"WIN11\"#search --no-floppy --fs-uuid --set=winpart ${WIN_UUID}#" \
-        "$MNT_ESP/boot/grub/grub.cfg"
 fi
 
 # When using signed shim, the GRUB binary looks for grub.cfg relative to
@@ -521,6 +483,9 @@ info "========================================="
 info ""
 info "Next steps:"
 info "  1. Copy Linux ISO files into the 'isos/' folder on the LINUXISOS partition."
-info "  2. Boot from the USB drive — GRUB auto-detects every ISO and builds the menu."
-info "     No need to edit grub.cfg — supported distros are recognised automatically."
+info "  2. Run: sudo ./update-grub.sh $DEVICE"
+info "     This scans your ISOs and writes a static, Secure Boot-safe GRUB menu."
+info "  3. Boot from the USB drive."
+info ""
+info "Re-run update-grub.sh whenever you add, remove, or rename ISOs."
 echo ""
