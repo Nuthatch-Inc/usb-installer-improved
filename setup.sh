@@ -206,6 +206,8 @@ for cmd in sgdisk mkfs.fat mkfs.exfat wipefs lsblk partprobe; do
     command -v "$cmd" >/dev/null || die "Required command not found: $cmd"
 done
 
+command -v blkid >/dev/null || die "Required command not found: blkid"
+
 if [[ -n "$WIN_ISO" ]]; then
     [[ -f "$WIN_ISO" ]] || die "Windows ISO not found: $WIN_ISO"
     command -v mkfs.ntfs >/dev/null || die "mkfs.ntfs not found (install ntfs-3g)"
@@ -360,6 +362,19 @@ if [[ -n "$WIN_ISO" ]]; then
     mkfs.ntfs -f -L "WIN11" "${PART_PREFIX}3"
 fi
 
+# Capture filesystem UUIDs so GRUB can target this USB explicitly
+ESP_UUID="$(blkid -s UUID -o value "${PART_PREFIX}1" || true)"
+ISO_UUID="$(blkid -s UUID -o value "${PART_PREFIX}2" || true)"
+[[ -n "$ESP_UUID" ]] || die "Could not read UUID for ${PART_PREFIX}1 (ESP)"
+[[ -n "$ISO_UUID" ]] || die "Could not read UUID for ${PART_PREFIX}2 (LINUXISOS)"
+
+if [[ -n "$WIN_ISO" ]]; then
+    WIN_UUID="$(blkid -s UUID -o value "${PART_PREFIX}3" || true)"
+    [[ -n "$WIN_UUID" ]] || die "Could not read UUID for ${PART_PREFIX}3 (WIN11)"
+else
+    WIN_UUID=""
+fi
+
 # ── Mount points ─────────────────────────────────────────────────
 MNT_ESP=$(mktemp -d)
 MNT_ISO=$(mktemp -d)
@@ -418,11 +433,10 @@ mkdir -p "$MNT_ESP/boot/grub"
 if [[ -f "$GRUB_CFG_SRC" ]]; then
     cp "$GRUB_CFG_SRC" "$MNT_ESP/boot/grub/grub.cfg"
 else
-    warn "grub.cfg not found alongside this script — writing a stub"
+    warn "grub.cfg not found alongside this script — writing a minimal stub"
     cat > "$MNT_ESP/boot/grub/grub.cfg" <<'GRUBEOF'
 set timeout=30
 set default=0
-
 insmod part_gpt
 insmod fat
 insmod exfat
@@ -432,15 +446,43 @@ insmod iso9660
 insmod linux
 insmod chain
 insmod search
+insmod regexp
 
-# Locate the Linux ISO partition by label
 search --no-floppy --label --set=isopart "LINUXISOS"
+search --no-floppy --label --set=winpart "WIN11"
 
-menuentry ">>> Add ISOs to the LINUXISOS partition <<<" {
-    echo "Copy .iso files to the LINUXISOS partition, then add menu entries to grub.cfg"
-    sleep 5
+for file in ($isopart)/isos/*.iso; do
+    if [ ! -e "$file" ]; then break; fi
+    regexp --set=1:isoname '\/isos\/(.+)$' "$file"
+    regexp --set=1:isopath '(\/.*)$' "$file"
+    menuentry "Boot ${isoname}" "$isopath" {
+        loopback loop ($isopart)$1
+        linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=$1 quiet splash ---
+        initrd (loop)/casper/initrd
+    }
+done
+
+menuentry "Windows 11 Installer" {
+    if [ -n "$winpart" ]; then
+        chainloader ($winpart)/efi/boot/bootx64.efi
+    else
+        echo "Windows 11 partition not found."
+        sleep 5
+    fi
 }
 GRUBEOF
+fi
+
+# Replace label-based searches with UUID-based searches to avoid matching
+# similarly-labeled internal disks (e.g. another "ESP" or "WIN11").
+sed -i -E \
+    "s#^search --no-floppy --label --set=isopart \"LINUXISOS\"#search --no-floppy --fs-uuid --set=isopart ${ISO_UUID}#" \
+    "$MNT_ESP/boot/grub/grub.cfg"
+
+if [[ -n "$WIN_UUID" ]]; then
+    sed -i -E \
+        "s#^search --no-floppy --label --set=winpart \"WIN11\"#search --no-floppy --fs-uuid --set=winpart ${WIN_UUID}#" \
+        "$MNT_ESP/boot/grub/grub.cfg"
 fi
 
 # When using signed shim, the GRUB binary looks for grub.cfg relative to
@@ -448,10 +490,10 @@ fi
 # so it always finds the real config.
 if $USE_SHIM; then
     mkdir -p "$MNT_ESP/EFI/BOOT"
-    cat > "$MNT_ESP/EFI/BOOT/grub.cfg" <<'SHIMCFG'
-search --no-floppy --label --set=esp "ESP"
-set prefix=($esp)/boot/grub
-configfile ($esp)/boot/grub/grub.cfg
+    cat > "$MNT_ESP/EFI/BOOT/grub.cfg" <<SHIMCFG
+search --no-floppy --fs-uuid --set=esp ${ESP_UUID}
+set prefix=(\$esp)/boot/grub
+configfile (\$esp)/boot/grub/grub.cfg
 SHIMCFG
     info "Wrote shim redirect config to EFI/BOOT/grub.cfg"
 fi
@@ -469,18 +511,6 @@ if [[ -n "$WIN_ISO" ]]; then
         bsdtar) bsdtar xf "$WIN_ISO" -C "$MNT_WIN" ;;
     esac
     info "Windows extraction complete."
-
-    # Append a Windows chainload entry to grub.cfg if not already present
-    if ! grep -q "Windows 11" "$MNT_ESP/boot/grub/grub.cfg"; then
-        cat >> "$MNT_ESP/boot/grub/grub.cfg" <<'WINEOF'
-
-# ── Windows 11 ───────────────────────────────────────────────────
-search --no-floppy --label --set=winpart "WIN11"
-menuentry "Windows 11 Installer" {
-    chainloader ($winpart)/efi/boot/bootx64.efi
-}
-WINEOF
-    fi
 fi
 
 # ── Done ─────────────────────────────────────────────────────────
@@ -491,6 +521,6 @@ info "========================================="
 info ""
 info "Next steps:"
 info "  1. Copy Linux ISO files into the 'isos/' folder on the LINUXISOS partition."
-info "  2. Edit grub.cfg on the ESP to add menu entries (see grub.cfg template)."
-info "  3. Boot from the USB drive — select an OS from the GRUB menu."
+info "  2. Boot from the USB drive — GRUB auto-detects every ISO and builds the menu."
+info "     No need to edit grub.cfg — supported distros are recognised automatically."
 echo ""

@@ -1,6 +1,6 @@
 # usb-installer-improved
 
-A multi-boot USB drive creator built on GRUB2 — no Ventoy, no opaque binaries. Supports **Ubuntu**, **Fedora**, and **Windows 11** from a single 128 GB flash drive.
+A multi-boot USB drive creator built on GRUB2 — no Ventoy, no opaque binaries. Drop in any supported ISO and GRUB auto-detects it at boot time. Supports **Ubuntu**, **Fedora**, **Debian**, **Arch**, **openSUSE**, **Windows 11**, and more from a single flash drive.
 
 ## How it works
 
@@ -10,7 +10,7 @@ A multi-boot USB drive creator built on GRUB2 — no Ventoy, no opaque binaries.
 | Linux ISOs (~110 GB) | exFAT | Drop-in `.iso` files |
 | Windows 11 (8 GB) | NTFS | Extracted Windows installer |
 
-- Linux distros boot via GRUB's `loopback` — mount an ISO in-place and launch the kernel directly.
+- Linux distros boot via GRUB's `loopback` — at boot time GRUB scans `isos/*.iso`, probes each ISO's internal layout to identify the distro family, and builds the menu automatically.
 - Windows chainloads its native boot manager from a real NTFS partition.
 
 ## Quick start
@@ -28,11 +28,21 @@ cp ubuntu-24.04.2-desktop-amd64.iso /media/$USER/LINUXISOS/isos/
 cp Fedora-Workstation-Live-x86_64-41.iso /media/$USER/LINUXISOS/isos/
 ```
 
-Boot from the USB — GRUB presents a menu with all available OSes.
+Boot from the USB — GRUB automatically detects every ISO and builds the menu.
 
 ## Adding or updating ISOs
 
-**Linux:** Just copy the new ISO to `isos/` on the LINUXISOS partition, then edit `grub.cfg` on the ESP to update or add the menu entry.
+**Linux:** Just copy (or remove) ISO files in `isos/` on the LINUXISOS partition. No config editing needed — GRUB rescans on every boot. Supported distro families are detected automatically:
+
+| Family | How it's detected | Examples |
+|--------|-------------------|----------|
+| Ubuntu / casper | `/casper/vmlinuz` inside the ISO | Ubuntu, Linux Mint, Pop!_OS, elementary |
+| Fedora / Anaconda | `/images/pxeboot/vmlinuz` | Fedora, RHEL, CentOS, Rocky, Alma |
+| Debian live | `/live/vmlinuz` | Debian, Kali, Tails |
+| Arch | `/arch/boot/x86_64/vmlinuz-linux` | Arch Linux, EndeavourOS |
+| openSUSE | `/boot/x86_64/loader/linux` | openSUSE Leap/Tumbleweed, SLES |
+
+Unrecognised ISOs still appear in the menu with a casper-based fallback.
 
 **Windows:** Re-run `setup.sh` with `--win-iso`, or manually extract a new ISO to the WIN11 partition.
 
@@ -70,7 +80,7 @@ This uses Microsoft's UEFI CA chain — no MOK enrollment needed.
 | File | Purpose |
 |------|---------|
 | `setup.sh` | Partitions, formats, and installs GRUB on the USB drive |
-| `grub.cfg` | GRUB menu configuration with entries for Ubuntu, Fedora, and Windows |
+| `grub.cfg` | GRUB menu — dynamically scans ISOs at boot, no manual editing needed |
 | `MULTIBOOT_OPTIONS.md` | Design analysis comparing the three implementation approaches |
 
 ## License
