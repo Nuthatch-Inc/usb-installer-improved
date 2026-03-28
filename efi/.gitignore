@@ -1,0 +1,4 @@
+# Downloaded EFI binaries (from download-efi.sh)
+# These are large binary files — download fresh rather than committing.
+efi/boot/
+efi/grub-modules/
