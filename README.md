@@ -64,14 +64,18 @@ sudo dnf install gdisk dosfstools exfatprogs ntfs-3g grub2-efi-x64 p7zip
 
 ## Secure Boot
 
-The setup script installs GRUB with `--removable`, which places the EFI binary at the standard fallback path. For Secure Boot support, copy Ubuntu's signed shim:
+The bundled EFI binaries (`efi/boot/`) are Ubuntu's Microsoft-signed shim + GRUB,
+downloaded by `./download-efi.sh`. Ubuntu's GRUB is used because it does **not**
+auto-scan for host OS entries (unlike Fedora's `blscfg`-enabled GRUB).
+
+To refresh or update the binaries:
 
 ```bash
-# On an Ubuntu host
-sudo apt install shim-signed grub-efi-amd64-signed
-cp /usr/lib/shim/shimx64.efi.signed /media/$USER/ESP/EFI/BOOT/bootx64.efi
-cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed /media/$USER/ESP/EFI/BOOT/grubx64.efi
+./download-efi.sh                  # defaults to Ubuntu 24.04 (noble)
+./download-efi.sh --release jammy  # pin a specific release
 ```
+
+Then re-run `setup.sh` to write them to the USB.
 
 This uses Microsoft's UEFI CA chain — no MOK enrollment needed.
 

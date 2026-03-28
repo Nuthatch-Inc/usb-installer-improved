@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 #
-# download-efi.sh — Download Microsoft-signed shim + Fedora-signed GRUB EFI
+# download-efi.sh — Download Microsoft-signed shim + Ubuntu-signed GRUB EFI
 #                    binaries for Secure Boot support on removable USB drives.
 #
-# The shim (shimx64.efi) is signed by Microsoft's UEFI third-party CA, so it
-# is trusted by virtually all Secure-Boot-enabled firmware.  The shim then
-# chainloads grubx64.efi, which is signed by Red Hat / Fedora's key (embedded
-# inside the shim).
+# Why Ubuntu?  Ubuntu's signed grubx64.efi does NOT auto-scan for BLS entries
+# on other disks (unlike Fedora's, which uses blscfg and shows host OS entries
+# on the USB's GRUB menu).  The shim is signed by Microsoft's UEFI third-party
+# CA, so it is trusted by virtually all Secure-Boot-enabled firmware.
 #
-# Downloaded binaries are placed in  efi/boot/  next to this script.
+# Downloaded binaries are placed in  efi/boot/  and  efi/grub-modules/.
 #
 # Usage:
-#   ./download-efi.sh            # uses latest Fedora release
-#   ./download-efi.sh --release 41   # pin a specific Fedora release
+#   ./download-efi.sh                     # uses Ubuntu 24.04 LTS (noble)
+#   ./download-efi.sh --release jammy     # pin a specific Ubuntu release
 #
-# Requirements: curl, rpm2cpio, cpio  (common on most distros)
+# Requirements: curl, ar, tar/zstd  (common on most distros)
 
 set -euo pipefail
 
@@ -29,83 +29,100 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --release) RELEASE="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--release FEDORA_VERSION]"
+            echo "Usage: $0 [--release UBUNTU_CODENAME]"
+            echo "  Default: noble (24.04 LTS)"
+            echo "  Examples: jammy, noble, oracular"
             exit 0
             ;;
         *) die "Unknown argument: $1" ;;
     esac
 done
 
-# ── Detect latest Fedora release if not pinned ───────────────────
-if [[ -z "$RELEASE" ]]; then
-    info "Detecting latest Fedora release..."
-    RELEASE=$(curl -sI https://mirror.fcix.net/fedora/linux/releases/ \
-        | grep -oP 'releases/\K[0-9]+' | sort -n | tail -1 || true)
-    if [[ -z "$RELEASE" ]]; then
-        # Fallback: scrape the directory listing
-        RELEASE=$(curl -sL https://mirror.fcix.net/fedora/linux/releases/ \
-            | grep -oP 'href="[0-9]+/"' | grep -oP '[0-9]+' | sort -n | tail -1 || true)
-    fi
-    [[ -n "$RELEASE" ]] || die "Could not detect Fedora release. Use --release N."
-fi
-info "Using Fedora release: $RELEASE"
+[[ -n "$RELEASE" ]] || RELEASE="noble"
+info "Using Ubuntu release: $RELEASE"
 
 # ── Dependency check ─────────────────────────────────────────────
-for cmd in curl rpm2cpio cpio; do
+for cmd in curl ar tar; do
     command -v "$cmd" >/dev/null || die "Required command not found: $cmd"
 done
 
 # ── Setup paths ──────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EFI_DIR="$SCRIPT_DIR/efi/boot"
+MODULES_DIR="$SCRIPT_DIR/efi/grub-modules"
 WORK_DIR=$(mktemp -d)
 
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
 
-mkdir -p "$EFI_DIR"
+mkdir -p "$EFI_DIR" "$MODULES_DIR"
 
-# ── Mirror base URL ──────────────────────────────────────────────
-MIRROR="https://mirror.fcix.net/fedora/linux/releases/${RELEASE}/Everything/x86_64/os/Packages/s"
-MIRROR_GRUB="https://mirror.fcix.net/fedora/linux/releases/${RELEASE}/Everything/x86_64/os/Packages/g"
+# ── Helper: extract a .deb file ──────────────────────────────────
+# .deb files are ar archives containing data.tar.{xz,zst,gz}
+extract_deb() {
+    local deb="$1" dest="$2"
+    mkdir -p "$dest"
+    cd "$dest"
+    ar x "$deb"
+    # Find and extract the data archive (could be .xz, .zst, .gz, or .tar)
+    local data_tar
+    data_tar=$(ls data.tar.* 2>/dev/null | head -1)
+    [[ -n "$data_tar" ]] || die "No data.tar.* found in $deb"
+    case "$data_tar" in
+        *.zst) command -v zstd >/dev/null || die "zstd required to extract $data_tar"; zstd -dq "$data_tar" -o data.tar; tar xf data.tar ;;
+        *.xz)  tar xJf "$data_tar" ;;
+        *.gz)  tar xzf "$data_tar" ;;
+        *.bz2) tar xjf "$data_tar" ;;
+        *)     tar xf "$data_tar" ;;
+    esac
+}
 
-# ── Find and download the shim-x64 RPM ──────────────────────────
-info "Searching for shim-x64 package..."
-SHIM_RPM=$(curl -sL "$MIRROR/" \
-    | grep -oP 'href="(shim-x64-[0-9][^"]*\.x86_64\.rpm)"' \
-    | grep -oP 'shim-x64-[^"]+' | sort -V | tail -1)
-[[ -n "$SHIM_RPM" ]] || die "Could not find shim-x64 RPM in Fedora $RELEASE mirror"
+# ── Ubuntu archive base URL ──────────────────────────────────────
+ARCHIVE="http://archive.ubuntu.com/ubuntu"
+POOL_SHIM="$ARCHIVE/pool/main/s/shim-signed"
+POOL_GRUB="$ARCHIVE/pool/main/g/grub2-signed"
+POOL_GRUB_MODS="$ARCHIVE/pool/main/g/grub2-unsigned"
 
-info "Downloading $SHIM_RPM..."
-curl -sL "$MIRROR/$SHIM_RPM" -o "$WORK_DIR/shim.rpm"
+# ── Find and download the shim-signed .deb ───────────────────────
+info "Searching for shim-signed package..."
+SHIM_DEB=$(curl -sL "$POOL_SHIM/" \
+    | grep -oP 'href="(shim-signed_[0-9][^"]*_amd64\.deb)"' \
+    | grep -oP 'shim-signed_[^"]+' | sort -V | tail -1)
+[[ -n "$SHIM_DEB" ]] || die "Could not find shim-signed .deb in Ubuntu archive"
 
-# ── Find and download the grub2-efi-x64 RPM ─────────────────────
-info "Searching for grub2-efi-x64 package..."
-GRUB_RPM=$(curl -sL "$MIRROR_GRUB/" \
-    | grep -oP 'href="(grub2-efi-x64-[0-9][^"]*\.x86_64\.rpm)"' \
-    | grep -oP 'grub2-efi-x64-[^"]+' | head -1)
-[[ -n "$GRUB_RPM" ]] || die "Could not find grub2-efi-x64 RPM in Fedora $RELEASE mirror"
+info "Downloading $SHIM_DEB..."
+curl -sL "$POOL_SHIM/$SHIM_DEB" -o "$WORK_DIR/shim.deb"
 
-info "Downloading $GRUB_RPM..."
-curl -sL "$MIRROR_GRUB/$GRUB_RPM" -o "$WORK_DIR/grub.rpm"
+# ── Find and download the grub-efi-amd64-signed .deb ────────────
+info "Searching for grub-efi-amd64-signed package..."
+GRUB_DEB=$(curl -sL "$POOL_GRUB/" \
+    | grep -oP 'href="(grub-efi-amd64-signed_[0-9][^"]*_amd64\.deb)"' \
+    | grep -oP 'grub-efi-amd64-signed_[^"]+' | sort -V | tail -1)
+[[ -n "$GRUB_DEB" ]] || die "Could not find grub-efi-amd64-signed .deb in Ubuntu archive"
 
-# ── Find and download grub2-efi-x64-modules RPM ─────────────────
-info "Searching for grub2-efi-x64-modules package..."
-GRUB_MOD_RPM=$(curl -sL "$MIRROR_GRUB/" \
-    | grep -oP 'href="(grub2-efi-x64-modules-[0-9][^"]*\.noarch\.rpm)"' \
-    | grep -oP 'grub2-efi-x64-modules-[^"]+' | head -1)
+info "Downloading $GRUB_DEB..."
+curl -sL "$POOL_GRUB/$GRUB_DEB" -o "$WORK_DIR/grub.deb"
+
+# ── Find and download the grub-efi-amd64-bin .deb (modules) ─────
+info "Searching for grub-efi-amd64-bin package (modules)..."
+GRUB_MOD_DEB=$(curl -sL "$POOL_GRUB_MODS/" \
+    | grep -oP 'href="(grub-efi-amd64-bin_[0-9][^"]*_amd64\.deb)"' \
+    | grep -oP 'grub-efi-amd64-bin_[^"]+' | sort -V | tail -1)
 
 # ── Extract EFI binaries ─────────────────────────────────────────
 info "Extracting EFI binaries..."
 
-# shim-x64: shimx64.efi + mmx64.efi
-cd "$WORK_DIR"
-mkdir shim && cd shim
-rpm2cpio ../shim.rpm | cpio -idm 2>/dev/null
+# shim-signed: shimx64.efi.signed + mmx64.efi
+extract_deb "$WORK_DIR/shim.deb" "$WORK_DIR/shim"
 
-SHIM_SRC=$(find . -name 'shimx64.efi' -print -quit)
-MM_SRC=$(find . -name 'mmx64.efi' -print -quit)
-[[ -n "$SHIM_SRC" ]] || die "shimx64.efi not found in shim RPM"
+# Ubuntu's shim-signed package contains multiple variants:
+#   shimx64.efi              — UNSIGNED (not usable with Secure Boot!)
+#   shimx64.efi.signed.latest — Microsoft UEFI CA signed
+#   shimx64.efi.dualsigned    — Microsoft + Canonical dual-signed (best)
+# We must pick the signed variant; the bare shimx64.efi is NOT signed.
+SHIM_SRC=$(find "$WORK_DIR/shim" \( -name 'shimx64.efi.dualsigned' -o -name 'shimx64.efi.signed.latest' -o -name 'shimx64.efi.signed' \) 2>/dev/null | sort | head -1)
+MM_SRC=$(find "$WORK_DIR/shim" -name 'mmx64.efi' 2>/dev/null | head -1)
+[[ -n "$SHIM_SRC" ]] || die "Signed shimx64.efi not found in shim-signed .deb (looked for .dualsigned / .signed.latest / .signed)"
 
 cp "$SHIM_SRC" "$EFI_DIR/BOOTX64.EFI"
 info "  ✓ shimx64.efi → efi/boot/BOOTX64.EFI"
@@ -113,35 +130,38 @@ info "  ✓ shimx64.efi → efi/boot/BOOTX64.EFI"
 if [[ -n "$MM_SRC" ]]; then
     cp "$MM_SRC" "$EFI_DIR/mmx64.efi"
     info "  ✓ mmx64.efi  → efi/boot/mmx64.efi"
+else
+    warn "  mmx64.efi not found (MOK enrollment won't be available)"
 fi
 
-# grub2-efi-x64: grubx64.efi
-cd "$WORK_DIR"
-mkdir grub && cd grub
-rpm2cpio ../grub.rpm | cpio -idm 2>/dev/null
+# grub-efi-amd64-signed: grubx64.efi.signed
+extract_deb "$WORK_DIR/grub.deb" "$WORK_DIR/grub"
 
-GRUB_SRC=$(find . -name 'grubx64.efi' -print -quit)
-[[ -n "$GRUB_SRC" ]] || die "grubx64.efi not found in grub2-efi-x64 RPM"
+GRUB_SRC=$(find "$WORK_DIR/grub" -name 'grubx64.efi.signed' 2>/dev/null | head -1)
+[[ -n "$GRUB_SRC" ]] || GRUB_SRC=$(find "$WORK_DIR/grub" -name 'grubx64.efi' 2>/dev/null | head -1)
+[[ -n "$GRUB_SRC" ]] || die "grubx64.efi not found in grub-efi-amd64-signed .deb"
 
 cp "$GRUB_SRC" "$EFI_DIR/grubx64.efi"
 info "  ✓ grubx64.efi → efi/boot/grubx64.efi"
 
-# grub2-efi-x64-modules: *.mod files for insmod in grub.cfg
-if [[ -n "${GRUB_MOD_RPM:-}" ]]; then
-    info "Downloading $GRUB_MOD_RPM..."
-    curl -sL "$MIRROR_GRUB/$GRUB_MOD_RPM" -o "$WORK_DIR/grub-modules.rpm"
+# grub-efi-amd64-bin: *.mod files for insmod in grub.cfg
+if [[ -n "${GRUB_MOD_DEB:-}" ]]; then
+    info "Downloading $GRUB_MOD_DEB..."
+    curl -sL "$POOL_GRUB_MODS/$GRUB_MOD_DEB" -o "$WORK_DIR/grub-modules.deb"
 
-    cd "$WORK_DIR"
-    mkdir grub-mod && cd grub-mod
-    rpm2cpio ../grub-modules.rpm | cpio -idm 2>/dev/null
+    extract_deb "$WORK_DIR/grub-modules.deb" "$WORK_DIR/grub-mod"
 
-    MOD_DIR=$(find . -type d -name 'x86_64-efi' -print -quit)
+    MOD_DIR=$(find "$WORK_DIR/grub-mod" -type d -name 'x86_64-efi' -print -quit)
     if [[ -n "$MOD_DIR" ]]; then
-        mkdir -p "$SCRIPT_DIR/efi/grub-modules"
-        cp "$MOD_DIR"/*.{mod,lst} "$SCRIPT_DIR/efi/grub-modules/" 2>/dev/null || true
-        MOD_COUNT=$(ls -1 "$SCRIPT_DIR/efi/grub-modules/"*.mod 2>/dev/null | wc -l)
+        cp "$MOD_DIR"/*.mod "$MODULES_DIR/" 2>/dev/null || true
+        cp "$MOD_DIR"/*.lst "$MODULES_DIR/" 2>/dev/null || true
+        MOD_COUNT=$(find "$MODULES_DIR" -name '*.mod' | wc -l)
         info "  ✓ $MOD_COUNT GRUB modules → efi/grub-modules/"
+    else
+        warn "x86_64-efi module directory not found in grub-efi-amd64-bin"
     fi
+else
+    warn "grub-efi-amd64-bin package not found — modules will not be updated"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────
@@ -152,11 +172,12 @@ info "========================================="
 info ""
 info "Contents of efi/boot/:"
 ls -lh "$EFI_DIR/"
-if [[ -d "$SCRIPT_DIR/efi/grub-modules" ]]; then
-    MOD_COUNT=$(ls -1 "$SCRIPT_DIR/efi/grub-modules/"*.mod 2>/dev/null | wc -l)
+MOD_COUNT=$(find "$MODULES_DIR" -name '*.mod' 2>/dev/null | wc -l)
+if [[ "$MOD_COUNT" -gt 0 ]]; then
     info "GRUB modules: $MOD_COUNT files in efi/grub-modules/"
 fi
 echo ""
-info "These are Secure-Boot-signed binaries from Fedora $RELEASE."
+info "These are Secure-Boot-signed binaries from Ubuntu ($RELEASE)."
+info "Ubuntu's GRUB does NOT auto-scan for host OS entries (no BLS/blscfg)."
 info "Run setup.sh to create your multi-boot USB drive."
 echo ""
