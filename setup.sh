@@ -413,10 +413,15 @@ if [[ -n "$WIN_ISO" && -n "$WIN_PART_NUM" ]]; then
     MNT_WIN=$(mktemp -d)
     mount "$win_dev" "$MNT_WIN"
 
-    info "Extracting Windows 11 ISO (this may take a few minutes)..."
+    # Strategy: extract to a temp directory first, then split any
+    # .wim files exceeding FAT32's 4 GB limit, then copy everything
+    # to the FAT32 partition. We can't extract directly to FAT32
+    # because 7z/bsdtar would fail on the >4 GB install.wim.
+    WIN_STAGING=$(mktemp -d)
+    info "Extracting Windows 11 ISO to staging area..."
     case "$EXTRACT_CMD" in
-        7z)     7z x "$WIN_ISO" -o"$MNT_WIN" -bso0 -bsp1 ;;
-        bsdtar) bsdtar xf "$WIN_ISO" -C "$MNT_WIN" ;;
+        7z)     7z x "$WIN_ISO" -o"$WIN_STAGING" -bso0 -bsp1 ;;
+        bsdtar) bsdtar xf "$WIN_ISO" -C "$WIN_STAGING" ;;
     esac
 
     # Split any .wim files that exceed FAT32's 4 GB file size limit.
@@ -434,7 +439,11 @@ if [[ -n "$WIN_ISO" && -n "$WIN_PART_NUM" ]]; then
             rm -f "$wim_file"
             info "  ✓ $wim_name split into .swm files"
         fi
-    done < <(find "$MNT_WIN" -name '*.wim' -print0 2>/dev/null)
+    done < <(find "$WIN_STAGING" -name '*.wim' -print0 2>/dev/null)
+
+    info "Copying Windows files to FAT32 partition..."
+    cp -a "$WIN_STAGING"/. "$MNT_WIN"/
+    rm -rf "$WIN_STAGING"
 
     info "  ✓ Windows extraction complete"
 fi
@@ -450,6 +459,7 @@ cleanup() {
     [[ -n "$MNT_WIN" ]] && { umount "$MNT_WIN" 2>/dev/null || true; }
     rmdir "$MNT_ESP" 2>/dev/null || true
     [[ -n "$MNT_WIN" ]] && { rmdir "$MNT_WIN" 2>/dev/null || true; }
+    [[ -n "${WIN_STAGING:-}" ]] && rm -rf "$WIN_STAGING" 2>/dev/null || true
 }
 trap cleanup EXIT
 
