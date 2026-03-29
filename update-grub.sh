@@ -1,30 +1,20 @@
 #!/usr/bin/env bash
 #
-# update-grub.sh — Scan ISOs on the USB and write a static grub.cfg
+# update-grub.sh — Rebuild grub.cfg by scanning ISO partitions
 #
-# This is step 2 of the multi-boot USB workflow:
-#   1. sudo ./setup.sh /dev/sdX [--win-iso ...]   — partition & format
-#   2. Copy .iso files to isos/ on the LINUXISOS partition
-#   3. sudo ./update-grub.sh /dev/sdX              — rebuild GRUB menu
+# Use this after adding/removing ISOs with add-iso.sh / remove-iso.sh,
+# or any time you need to regenerate the GRUB menu.
 #
-# Run this again whenever you add, remove, or rename ISOs.
+# The script scans all non-ESP, non-Windows GPT partitions on the
+# device, mounts each one as ISO9660, detects the distro family,
+# and writes a GRUB menu entry that loads the kernel and initrd
+# directly from the ISO partition.
 #
-# The generated grub.cfg uses ONLY modules built into Ubuntu's signed
-# grubx64.efi (no insmod lines), so it is fully Secure Boot compatible.
+# GRUB has iso9660 built into the signed binary, so it can read
+# these partitions natively — no extraction, no exFAT, no insmod.
 #
-# Note: Ubuntu's signed GRUB only has FAT/ext2/btrfs/iso9660 built
-# in — it CANNOT read the exFAT LINUXISOS partition.  This script
-# extracts vmlinuz + initrd from each ISO into boot/kernels/<slug>/
-# on the ESP (FAT32), which GRUB can always read.  The running Linux
-# kernel has its own exFAT driver and locates each ISO at boot time
-# via iso-scan/filename (or equivalent kernel parameter).
-#
-# Supported distro families (auto-detected by mounting each ISO):
-#   - Ubuntu / Mint / Pop!_OS / elementary   (casper)
-#   - Fedora / RHEL / CentOS / Rocky / Alma  (Anaconda / pxeboot)
-#   - Debian / Kali / Tails                   (debian-live)
-#   - Arch Linux / EndeavourOS                (archiso)
-#   - openSUSE / SLES                         (SUSE loader)
+# Usage:
+#   sudo ./update-grub.sh /dev/sdX
 
 set -euo pipefail
 
@@ -39,10 +29,12 @@ DEVICE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
-            echo "Usage: sudo $0 /dev/sdX"
-            echo ""
-            echo "Scans ISOs on the LINUXISOS partition and writes a static"
-            echo "grub.cfg to the ESP. Run after adding or removing ISOs."
+            cat <<EOF
+Usage: sudo $0 /dev/sdX
+
+Scans ISO partitions on the USB drive and regenerates grub.cfg
+on the ESP. Run this after adding or removing ISOs.
+EOF
             exit 0
             ;;
         *)
@@ -67,49 +59,28 @@ else
 fi
 
 ESP_DEV="${PART_PREFIX}1"
-ISO_DEV="${PART_PREFIX}2"
-WIN_DEV="${PART_PREFIX}3"
-
 [[ -b "$ESP_DEV" ]] || die "ESP partition not found: $ESP_DEV"
-[[ -b "$ISO_DEV" ]] || die "ISO partition not found: $ISO_DEV"
 
-# ── Get UUIDs ────────────────────────────────────────────────────
-ESP_UUID="$(blkid -s UUID -o value "$ESP_DEV" 2>/dev/null || true)"
-[[ -n "$ESP_UUID" ]] || die "Could not read UUID for $ESP_DEV"
-
-ISO_UUID="$(blkid -s UUID -o value "$ISO_DEV" 2>/dev/null || true)"
-[[ -n "$ISO_UUID" ]] || die "Could not read UUID for $ISO_DEV"
-
-WIN_UUID=""
-if [[ -b "$WIN_DEV" ]]; then
-    WIN_UUID="$(blkid -s UUID -o value "$WIN_DEV" 2>/dev/null || true)"
-fi
-
-# ── Mount partitions ─────────────────────────────────────────────
+# ── Mount ESP ────────────────────────────────────────────────────
 MNT_ESP=$(mktemp -d)
-MNT_ISO=$(mktemp -d)
 MNT_PROBE=$(mktemp -d)
 
 cleanup() {
     umount "$MNT_PROBE" 2>/dev/null || true
-    umount "$MNT_ISO"   2>/dev/null || true
     umount "$MNT_ESP"   2>/dev/null || true
-    rmdir "$MNT_ESP" "$MNT_ISO" "$MNT_PROBE" 2>/dev/null || true
+    rmdir "$MNT_ESP" "$MNT_PROBE" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 mount "$ESP_DEV" "$MNT_ESP"
-mount "$ISO_DEV" "$MNT_ISO"
 
-# ── Verify expected layout ───────────────────────────────────────
 [[ -d "$MNT_ESP/EFI/BOOT" ]] || die "ESP does not have EFI/BOOT — run setup.sh first"
-[[ -d "$MNT_ISO/isos" ]]     || { warn "No isos/ directory found — creating it"; mkdir -p "$MNT_ISO/isos"; }
 
-# ── Scan ISOs and detect distro families ─────────────────────────
-declare -a ENTRIES=()
-ISO_COUNT=0
+ESP_UUID="$(blkid -s UUID -o value "$ESP_DEV" 2>/dev/null || true)"
+[[ -n "$ESP_UUID" ]] || die "Could not read UUID for $ESP_DEV"
 
-detect_distro() {
+# ── Distro detection helpers ─────────────────────────────────────
+detect_iso_distro() {
     local mnt="$1"
     if [[ -f "$mnt/casper/vmlinuz" ]]; then
         echo "casper"
@@ -126,228 +97,239 @@ detect_distro() {
     fi
 }
 
-# Generate a human-friendly label from an ISO filename
 pretty_name() {
     local name="$1"
-    # Strip .iso extension
-    name="${name%.iso}"
-    # Replace common separators with spaces
     name="${name//-/ }"
     name="${name//_/ }"
     echo "$name"
 }
 
-info "Scanning ISOs in $MNT_ISO/isos/..."
+# ── Scan all partitions on the device ────────────────────────────
+info "Scanning partitions on $DEVICE..."
 
-# ── Prepare extraction directory for kernels/initrds ─────────────
-# Ubuntu's signed GRUB has only FAT/ext2/btrfs/iso9660 built in —
-# no exFAT and no NTFS.  The LINUXISOS partition is exFAT, so GRUB
-# cannot read it at all.  We therefore extract vmlinuz + initrd to
-# the ESP (FAT32), which GRUB can always access.  The running Linux
-# kernel has its own exFAT driver and locates the ISO at runtime via
-# iso-scan/filename (or equivalent kernel parameter).
-BOOT_DIR="$MNT_ESP/boot/kernels"
-if [[ -d "$BOOT_DIR" ]]; then
-    info "Cleaning previous kernel extractions..."
-    rm -rf "$BOOT_DIR"
-fi
-mkdir -p "$BOOT_DIR"
+declare -a ISO_PARTS=()       # device paths for ISO partitions
+declare -a WIN_PARTS=()       # device paths for Windows partitions
 
-# Warn if ESP is getting tight (kernels ~110 MB per ISO)
-ESP_AVAIL_KB=$(df -k --output=avail "$MNT_ESP" | tail -1)
-if (( ESP_AVAIL_KB < 150000 )); then
-    warn "Less than 150 MB free on the ESP — some ISOs may not fit."
-    warn "Consider increasing the ESP size in setup.sh if you need many ISOs."
-fi
+# Enumerate all partitions (skip the whole-disk entry)
+while IFS= read -r part_dev; do
+    [[ -b "$part_dev" ]] || continue
 
-for iso in "$MNT_ISO"/isos/*.iso; do
-    [[ -f "$iso" ]] || continue
+    # Skip the ESP (partition 1)
+    [[ "$part_dev" == "$ESP_DEV" ]] && continue
 
-    filename="$(basename "$iso")"
-    isopath="/isos/$filename"
-    label="$(pretty_name "$filename")"
+    # Identify by filesystem type
+    fstype="$(blkid -s TYPE -o value "$part_dev" 2>/dev/null || true)"
+    partlabel="$(blkid -s PARTLABEL -o value "$part_dev" 2>/dev/null || true)"
 
-    info "  Found: $filename"
-
-    # Mount the ISO to probe its layout and extract kernel/initrd
-    mount -o loop,ro "$iso" "$MNT_PROBE" 2>/dev/null || {
-        warn "    Could not mount $filename — skipping"
-        continue
-    }
-
-    dtype="$(detect_distro "$MNT_PROBE")"
-    info "    Detected: $dtype"
-    ((ISO_COUNT++)) || true
-
-    # Sanitised directory name for extracted kernel + initrd
-    slug="${filename%.iso}"
-    extract_dir="$BOOT_DIR/$slug"
-    mkdir -p "$extract_dir"
-
-    case "$dtype" in
-        casper)
-            info "    Extracting kernel + initrd (casper)..."
-            cp "$MNT_PROBE/casper/vmlinuz" "$extract_dir/vmlinuz"
-            cp "$MNT_PROBE/casper/initrd"  "$extract_dir/initrd"
-            ENTRIES+=("
-menuentry \"$label\" {
-    linux (\$esppart)/boot/kernels/$slug/vmlinuz boot=casper iso-scan/filename=$isopath quiet splash ---
-    initrd (\$esppart)/boot/kernels/$slug/initrd
-}
-
-menuentry \"$label  (safe graphics)\" {
-    linux (\$esppart)/boot/kernels/$slug/vmlinuz boot=casper iso-scan/filename=$isopath quiet splash nomodeset ---
-    initrd (\$esppart)/boot/kernels/$slug/initrd
-}")
+    case "$fstype" in
+        iso9660)
+            ISO_PARTS+=("$part_dev")
             ;;
-        fedora)
-            info "    Extracting kernel + initrd (fedora)..."
-            cp "$MNT_PROBE/images/pxeboot/vmlinuz"   "$extract_dir/vmlinuz"
-            cp "$MNT_PROBE/images/pxeboot/initrd.img" "$extract_dir/initrd"
-            ENTRIES+=("
-menuentry \"$label\" {
-    linux (\$esppart)/boot/kernels/$slug/vmlinuz iso-scan/filename=$isopath rd.live.image quiet
-    initrd (\$esppart)/boot/kernels/$slug/initrd
-}
-
-menuentry \"$label  (basic graphics)\" {
-    linux (\$esppart)/boot/kernels/$slug/vmlinuz iso-scan/filename=$isopath rd.live.image nomodeset quiet
-    initrd (\$esppart)/boot/kernels/$slug/initrd
-}")
-            ;;
-        debian-live)
-            info "    Extracting kernel + initrd (debian-live)..."
-            cp "$MNT_PROBE/live/vmlinuz"    "$extract_dir/vmlinuz"
-            cp "$MNT_PROBE/live/initrd.img" "$extract_dir/initrd"
-            ENTRIES+=("
-menuentry \"$label\" {
-    linux (\$esppart)/boot/kernels/$slug/vmlinuz boot=live findiso=$isopath quiet splash ---
-    initrd (\$esppart)/boot/kernels/$slug/initrd
-}
-
-menuentry \"$label  (safe graphics)\" {
-    linux (\$esppart)/boot/kernels/$slug/vmlinuz boot=live findiso=$isopath quiet splash nomodeset ---
-    initrd (\$esppart)/boot/kernels/$slug/initrd
-}")
-            ;;
-        arch)
-            info "    Extracting kernel + initrd (arch)..."
-            cp "$MNT_PROBE/arch/boot/x86_64/vmlinuz-linux"       "$extract_dir/vmlinuz"
-            cp "$MNT_PROBE/arch/boot/x86_64/initramfs-linux.img" "$extract_dir/initrd"
-            ENTRIES+=("
-menuentry \"$label\" {
-    linux (\$esppart)/boot/kernels/$slug/vmlinuz img_dev=/dev/disk/by-uuid/$ISO_UUID img_loop=$isopath earlymodules=loop
-    initrd (\$esppart)/boot/kernels/$slug/initrd
-}
-
-menuentry \"$label  (safe graphics)\" {
-    linux (\$esppart)/boot/kernels/$slug/vmlinuz img_dev=/dev/disk/by-uuid/$ISO_UUID img_loop=$isopath earlymodules=loop nomodeset
-    initrd (\$esppart)/boot/kernels/$slug/initrd
-}")
-            ;;
-        opensuse)
-            info "    Extracting kernel + initrd (opensuse)..."
-            cp "$MNT_PROBE/boot/x86_64/loader/linux"  "$extract_dir/vmlinuz"
-            cp "$MNT_PROBE/boot/x86_64/loader/initrd" "$extract_dir/initrd"
-            ENTRIES+=("
-menuentry \"$label\" {
-    linux (\$esppart)/boot/kernels/$slug/vmlinuz iso-scan/filename=$isopath splash=silent quiet
-    initrd (\$esppart)/boot/kernels/$slug/initrd
-}
-
-menuentry \"$label  (safe graphics)\" {
-    linux (\$esppart)/boot/kernels/$slug/vmlinuz iso-scan/filename=$isopath splash=silent quiet nomodeset
-    initrd (\$esppart)/boot/kernels/$slug/initrd
-}")
+        ntfs)
+            WIN_PARTS+=("$part_dev")
             ;;
         *)
-            warn "    Unrecognised ISO layout — attempting casper fallback extraction"
-            cp "$MNT_PROBE/casper/vmlinuz" "$extract_dir/vmlinuz" 2>/dev/null || true
-            cp "$MNT_PROBE/casper/initrd"  "$extract_dir/initrd"  2>/dev/null || true
-            ENTRIES+=("
-menuentry \"$label  (unrecognised — casper fallback)\" {
-    linux (\$esppart)/boot/kernels/$slug/vmlinuz boot=casper iso-scan/filename=$isopath quiet splash ---
-    initrd (\$esppart)/boot/kernels/$slug/initrd
-}")
+            if [[ "$fstype" == "udf" ]]; then
+                # Some ISOs use UDF — treat as ISO
+                ISO_PARTS+=("$part_dev")
+            else
+                warn "  Skipping $part_dev (fstype=$fstype, label=$partlabel)"
+            fi
             ;;
     esac
+done < <(lsblk -rno NAME "$DEVICE" 2>/dev/null | tail -n +2 | awk '{print "/dev/" $1}')
 
-    umount "$MNT_PROBE" 2>/dev/null || true
-done
+info "Found ${#ISO_PARTS[@]} ISO partition(s), ${#WIN_PARTS[@]} Windows partition(s)"
 
-info "Found $ISO_COUNT ISO(s)"
-
-# ── Build the Windows entry ──────────────────────────────────────
-WIN_ENTRY=""
-if [[ -n "$WIN_UUID" ]]; then
-    WIN_ENTRY="
-# ══════════════════════════════════════════════════════════════════
-#  Windows 11
-# ══════════════════════════════════════════════════════════════════
-
-menuentry \"Windows 11 Installer\" {
-    search --no-floppy --fs-uuid --set=winpart $WIN_UUID
-    chainloader (\$winpart)/efi/boot/bootx64.efi
-}"
-fi
-
-# ── Write grub.cfg ───────────────────────────────────────────────
+# ── Build grub.cfg ───────────────────────────────────────────────
 GRUB_CFG="$MNT_ESP/boot/grub/grub.cfg"
 mkdir -p "$(dirname "$GRUB_CFG")"
 
-info "Writing grub.cfg to ESP..."
+info "Writing grub.cfg..."
 
 cat > "$GRUB_CFG" <<HEADER
-# GRUB2 configuration for multi-boot USB
+# GRUB2 configuration for multi-boot USB (partition-per-ISO)
 #
 # Auto-generated by update-grub.sh on $(date '+%Y-%m-%d %H:%M:%S')
-# Do not edit manually — re-run update-grub.sh after changing ISOs.
+# Re-run update-grub.sh after adding/removing ISOs.
 #
-# No insmod lines — all required modules are built into the signed
-# grubx64.efi binary. Fully Secure Boot compatible.
-#
-# Kernels and initrds are extracted to boot/kernels/<slug>/ on the
-# ESP (FAT32).  Ubuntu's signed GRUB only has FAT/ext2/btrfs/iso9660
-# built in — it CANNOT read the exFAT ISO partition.  The running
-# Linux kernel locates each ISO at boot time via iso-scan/filename.
+# Each Linux ISO lives in its own GPT partition (raw dd).
+# GRUB reads the kernel and initrd directly from the ISO9660
+# filesystem (which is built into the signed grubx64.efi).
+# No insmod lines — fully Secure Boot compatible.
 
 set timeout=30
 set default=0
 
-# ── Locate the ESP by UUID (FAT32 — always readable by GRUB) ────
-search --no-floppy --fs-uuid --set=esppart $ESP_UUID
-
 HEADER
 
-# Write ISO entries
-if [[ ${#ENTRIES[@]} -gt 0 ]]; then
+ENTRY_COUNT=0
+
+if [[ ${#ISO_PARTS[@]} -gt 0 ]]; then
     {
         echo "# ══════════════════════════════════════════════════════════════════"
-        echo "#  Linux ISOs ($ISO_COUNT found)"
+        echo "#  Linux ISOs (${#ISO_PARTS[@]} found)"
         echo "# ══════════════════════════════════════════════════════════════════"
-        for entry in "${ENTRIES[@]}"; do
-            echo "$entry"
-        done
+        echo ""
     } >> "$GRUB_CFG"
-else
+fi
+
+for part_dev in "${ISO_PARTS[@]}"; do
+    # Get filesystem UUID
+    fs_uuid="$(blkid -s UUID -o value "$part_dev" 2>/dev/null || true)"
+    if [[ -z "$fs_uuid" ]]; then
+        warn "  Could not get UUID for $part_dev — skipping"
+        continue
+    fi
+
+    # Get GPT partition label (the name we set with sgdisk -c)
+    partlabel="$(blkid -s PARTLABEL -o value "$part_dev" 2>/dev/null || true)"
+    label="$(pretty_name "${partlabel:-$(basename "$part_dev")}")"
+
+    # Mount and detect distro
+    mount -o ro "$part_dev" "$MNT_PROBE" 2>/dev/null || {
+        warn "  Could not mount $part_dev — skipping"
+        continue
+    }
+
+    dtype="$(detect_iso_distro "$MNT_PROBE")"
+    umount "$MNT_PROBE" 2>/dev/null || true
+
+    info "  $part_dev → $label ($dtype), UUID=$fs_uuid"
+
+    case "$dtype" in
+        casper)
+            cat >> "$GRUB_CFG" <<ENTRY
+menuentry "$label" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/casper/vmlinuz boot=casper quiet splash ---
+    initrd (\$isopart)/casper/initrd
+}
+
+menuentry "$label  (safe graphics)" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/casper/vmlinuz boot=casper quiet splash nomodeset ---
+    initrd (\$isopart)/casper/initrd
+}
+
+ENTRY
+            ;;
+        fedora)
+            cat >> "$GRUB_CFG" <<ENTRY
+menuentry "$label" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/images/pxeboot/vmlinuz root=live:UUID=$fs_uuid rd.live.image quiet
+    initrd (\$isopart)/images/pxeboot/initrd.img
+}
+
+menuentry "$label  (basic graphics)" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/images/pxeboot/vmlinuz root=live:UUID=$fs_uuid rd.live.image nomodeset quiet
+    initrd (\$isopart)/images/pxeboot/initrd.img
+}
+
+ENTRY
+            ;;
+        debian-live)
+            cat >> "$GRUB_CFG" <<ENTRY
+menuentry "$label" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/live/vmlinuz boot=live components quiet splash ---
+    initrd (\$isopart)/live/initrd.img
+}
+
+menuentry "$label  (safe graphics)" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/live/vmlinuz boot=live components quiet splash nomodeset ---
+    initrd (\$isopart)/live/initrd.img
+}
+
+ENTRY
+            ;;
+        arch)
+            cat >> "$GRUB_CFG" <<ENTRY
+menuentry "$label" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/arch/boot/x86_64/vmlinuz-linux archisodevice=/dev/disk/by-uuid/$fs_uuid
+    initrd (\$isopart)/arch/boot/x86_64/initramfs-linux.img
+}
+
+menuentry "$label  (safe graphics)" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/arch/boot/x86_64/vmlinuz-linux archisodevice=/dev/disk/by-uuid/$fs_uuid nomodeset
+    initrd (\$isopart)/arch/boot/x86_64/initramfs-linux.img
+}
+
+ENTRY
+            ;;
+        opensuse)
+            cat >> "$GRUB_CFG" <<ENTRY
+menuentry "$label" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/boot/x86_64/loader/linux root=live:UUID=$fs_uuid splash=silent quiet
+    initrd (\$isopart)/boot/x86_64/loader/initrd
+}
+
+menuentry "$label  (safe graphics)" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/boot/x86_64/loader/linux root=live:UUID=$fs_uuid splash=silent quiet nomodeset
+    initrd (\$isopart)/boot/x86_64/loader/initrd
+}
+
+ENTRY
+            ;;
+        *)
+            warn "  Unrecognised ISO layout on $part_dev — trying casper fallback"
+            cat >> "$GRUB_CFG" <<ENTRY
+menuentry "$label  (unrecognised — casper fallback)" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/casper/vmlinuz boot=casper quiet splash ---
+    initrd (\$isopart)/casper/initrd
+}
+
+ENTRY
+            ;;
+    esac
+
+    ((ENTRY_COUNT++)) || true
+done
+
+# ── Windows entries ──────────────────────────────────────────────
+for part_dev in "${WIN_PARTS[@]}"; do
+    win_uuid="$(blkid -s UUID -o value "$part_dev" 2>/dev/null || true)"
+    partlabel="$(blkid -s PARTLABEL -o value "$part_dev" 2>/dev/null || true)"
+
+    if [[ -n "$win_uuid" ]]; then
+        info "  $part_dev → Windows ($partlabel)"
+        cat >> "$GRUB_CFG" <<WINENTRY
+
+# ══════════════════════════════════════════════════════════════════
+#  Windows 11
+# ══════════════════════════════════════════════════════════════════
+
+menuentry "Windows 11 Installer" {
+    search --no-floppy --fs-uuid --set=winpart $win_uuid
+    chainloader (\$winpart)/efi/boot/bootx64.efi
+}
+
+WINENTRY
+    fi
+done
+
+# ── No-ISOs placeholder ─────────────────────────────────────────
+if [[ $ENTRY_COUNT -eq 0 && ${#WIN_PARTS[@]} -eq 0 ]]; then
     cat >> "$GRUB_CFG" <<'NOISO'
-menuentry ">>> No ISOs found — copy .iso files to isos/ on LINUXISOS <<<" {
-    echo "No ISO files were found when update-grub.sh last ran."
-    echo "Copy .iso files to the isos/ directory, then run:"
-    echo "  sudo ./update-grub.sh /dev/sdX"
+menuentry ">>> No ISOs found — run add-iso.sh to add ISOs <<<" {
+    echo "No ISO partitions were found on this drive."
+    echo "Run:  sudo ./add-iso.sh /dev/sdX path/to/some.iso"
     sleep 15
 }
+
 NOISO
 fi
 
-# Write Windows entry
-if [[ -n "$WIN_ENTRY" ]]; then
-    echo "$WIN_ENTRY" >> "$GRUB_CFG"
-fi
-
-# Write utility entries
+# ── Utility entries ──────────────────────────────────────────────
 cat >> "$GRUB_CFG" <<'UTILS'
-
 # ══════════════════════════════════════════════════════════════════
 #  Utilities
 # ══════════════════════════════════════════════════════════════════
@@ -365,11 +347,21 @@ menuentry "Power Off" {
 }
 UTILS
 
+# ── Update shim redirect ────────────────────────────────────────
+if [[ -f "$MNT_ESP/EFI/BOOT/BOOTX64.EFI" ]]; then
+    cat > "$MNT_ESP/EFI/BOOT/grub.cfg" <<SHIMCFG
+search --no-floppy --fs-uuid --set=esp ${ESP_UUID}
+set prefix=(\$esp)/boot/grub
+configfile (\$esp)/boot/grub/grub.cfg
+SHIMCFG
+fi
+
 sync
 info "grub.cfg written successfully."
 echo ""
 
-# ── Show summary ─────────────────────────────────────────────────
+# ── Summary ──────────────────────────────────────────────────────
+info "$ENTRY_COUNT Linux ISO(s), ${#WIN_PARTS[@]} Windows partition(s)"
 info "Menu entries:"
 grep -oP '(?<=menuentry ").*(?=")' "$GRUB_CFG" | while IFS= read -r entry; do
     info "  • $entry"

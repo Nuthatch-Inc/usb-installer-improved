@@ -1,42 +1,66 @@
 # usb-installer-improved
 
-A multi-boot USB drive creator built on GRUB2 — no Ventoy, no opaque binaries. Drop in any supported ISO, run one command to rebuild the menu, and boot. Supports **Ubuntu**, **Fedora**, **Debian**, **Arch**, **openSUSE**, **Windows 11**, and more from a single flash drive.
+A multi-boot USB drive creator built on GRUB2 — no Ventoy, no opaque binaries. Specify your ISOs at setup time (or add them later), and boot any of them from a single flash drive. Supports **Ubuntu**, **Fedora**, **Debian**, **Arch**, **openSUSE**, **Windows 11**, and more.
 
 ## How it works
 
+Each Linux ISO gets its own GPT partition, written raw with `dd`. GRUB reads the kernel and initrd directly from the ISO9660 filesystem — which is compiled into the signed `grubx64.efi` — so there's no extraction step, no exFAT limitations, and no unsigned module loading.
+
 | Partition | Format | Contents |
 |-----------|--------|----------|
-| ESP (512 MB) | FAT32 | GRUB2 EFI bootloader + config |
-| Linux ISOs (~110 GB) | exFAT | Drop-in `.iso` files |
-| Windows 11 (8 GB) | NTFS | Extracted Windows installer |
+| 1 (ESP) | FAT32 (512 MB) | GRUB2 EFI bootloader + config |
+| 2..N | ISO9660 (auto-sized) | One raw Linux ISO per partition |
+| N+1 (optional) | NTFS (8 GB) | Extracted Windows 11 installer |
 
-- Linux distros: `update-grub.sh` mounts each ISO, detects the distro family, **extracts the kernel + initrd** to `boot/kernels/<slug>/` on the ESP, and writes a static GRUB menu. Kernels must live on the ESP (FAT32) because Ubuntu's signed GRUB only has FAT/ext2/btrfs/iso9660 built in — it **cannot read the exFAT** ISO partition. The running Linux kernel has its own exFAT driver and locates the ISO at boot time via `iso-scan/filename` or equivalent kernel parameters.
-- Windows chainloads its native boot manager from a real NTFS partition.
-- **Fully Secure Boot compatible** — zero `insmod` lines. Ubuntu's signed `grubx64.efi` has all required modules built in. Kernels are loaded from the ESP (FAT32), which GRUB can always read; ISO files stay on the exFAT partition where only the Linux kernel needs to access them.
+### Why partition-per-ISO?
+
+Ubuntu's signed GRUB only has **FAT, ext2, btrfs, and iso9660** built in — it **cannot read exFAT or NTFS**. Earlier approaches stored ISOs on an exFAT partition and tried to loopback-mount them or extract kernels, but GRUB couldn't access the exFAT filesystem at all. Under Secure Boot, `insmod` can't load additional filesystem modules either.
+
+By writing each ISO raw into its own partition, the ISO9660 filesystem is directly on a GPT partition that GRUB can natively read. GRUB loads the kernel and initrd straight from the ISO, and the distro's initramfs finds its squashfs on the same partition at boot time.
+
+**Chainloading** (loading the ISO's own bootloader) was considered but doesn't work: UEFI firmware can only read FAT, so a chainloaded bootloader on an ISO9660 partition can't find its own config files. Instead, our GRUB uses `linux`/`initrd` to load kernels directly.
 
 ## Quick start
 
 ```bash
-# 1. Prepare the USB (Linux only, requires root)
-sudo ./setup.sh /dev/sdX --win-iso ~/Downloads/Win11_24H2.iso
+# 1. Download signed EFI binaries (one time)
+./download-efi.sh
 
-# 2. Copy your Linux ISOs to the LINUXISOS partition
-#    (it auto-mounts on most desktops after setup)
-cp ubuntu-24.04.2-desktop-amd64.iso /media/$USER/LINUXISOS/isos/
-cp Fedora-Workstation-Live-x86_64-41.iso /media/$USER/LINUXISOS/isos/
-
-# 3. Build the GRUB menu
-sudo ./update-grub.sh /dev/sdX
+# 2. Set up the USB drive with your ISOs
+sudo ./setup.sh /dev/sdX \
+    --iso ~/Downloads/ubuntu-26.04-desktop-amd64.iso \
+    --iso ~/Downloads/Fedora-Workstation-Live-x86_64-42.iso \
+    --win-iso ~/Downloads/Win11_24H2.iso
 ```
 
 Boot from the USB — done.
 
-## Adding or updating ISOs
+## Managing ISOs
 
-1. Copy (or remove) ISO files in `isos/` on the LINUXISOS partition.
-2. Re-run `sudo ./update-grub.sh /dev/sdX`.
+### Add an ISO (without wiping the drive)
 
-That's it. The script scans every ISO, detects the distro family, and rewrites `grub.cfg` with the correct boot parameters. Supported families:
+```bash
+sudo ./add-iso.sh /dev/sdX ~/Downloads/debian-12-amd64.iso
+```
+
+This creates a new partition, writes the ISO, and regenerates the GRUB menu.
+
+### Remove an ISO
+
+```bash
+sudo ./remove-iso.sh /dev/sdX --list    # see what's installed
+sudo ./remove-iso.sh /dev/sdX 3         # remove partition 3
+```
+
+### Rebuild the GRUB menu
+
+```bash
+sudo ./update-grub.sh /dev/sdX
+```
+
+Run this if the menu gets out of sync, or after manual partition changes.
+
+## Supported distros
 
 | Family | How it's detected | Examples |
 |--------|-------------------|----------|
@@ -48,36 +72,27 @@ That's it. The script scans every ISO, detects the distro family, and rewrites `
 
 Unrecognised ISOs get a casper-based fallback entry.
 
-**Windows:** Re-run `setup.sh` with `--win-iso`, or manually extract a new ISO to the WIN11 partition.
+**Windows 11** is extracted to an NTFS partition (UEFI firmware can read FAT for the Windows bootloader, and the installer handles the rest).
 
 ## Requirements
 
 - Linux host (for running the setup scripts)
-- `sgdisk`, `mkfs.fat`, `mkfs.exfat`, `mkfs.ntfs` (ntfs-3g), `grub-install`
-- `7z` or `bsdtar` (for Windows ISO extraction)
-- `blkid` (from `util-linux` — used for UUID detection)
+- A USB flash drive (128 GB recommended for multiple ISOs)
+- `sgdisk`, `mkfs.fat`, `blkid`, `dd` (from `util-linux` and `gdisk`)
+- `7z` or `bsdtar` (only for Windows ISO extraction)
+- `mkfs.ntfs` from `ntfs-3g` (only for Windows)
 
-On Ubuntu/Debian:
+Dependencies are auto-installed by `setup.sh` for most distros. On Fedora:
+
 ```bash
-sudo apt install gdisk dosfstools exfatprogs ntfs-3g grub-efi-amd64-bin p7zip-full
+sudo dnf install gdisk dosfstools parted util-linux grub2-efi-x64
 ```
-
-On Fedora:
-```bash
-sudo dnf install gdisk dosfstools exfatprogs ntfs-3g grub2-efi-x64 p7zip
-```
-
-Dependencies are auto-installed by `setup.sh` for most distros.
 
 ## Secure Boot
 
-The bundled EFI binaries (`efi/boot/`) are Ubuntu's Microsoft-signed shim + GRUB,
-downloaded by `./download-efi.sh`. Ubuntu's GRUB is used because it does **not**
-auto-scan for host OS entries (unlike Fedora's `blscfg`-enabled GRUB).
+The bundled EFI binaries (`efi/boot/`) are Ubuntu's Microsoft-signed shim + GRUB, downloaded by `./download-efi.sh`. Ubuntu's GRUB is used because it does **not** auto-scan for host OS entries (unlike Fedora's `blscfg`-enabled GRUB).
 
-The generated `grub.cfg` contains **no `insmod` lines** — all required modules are
-compiled into the signed binary. This avoids the Secure Boot signature-verification
-errors that occur when loading unsigned `.mod` files from disk.
+The generated `grub.cfg` contains **no `insmod` lines** — all required modules (including `iso9660`) are compiled into the signed binary. This avoids Secure Boot signature-verification errors that occur when loading unsigned `.mod` files from disk.
 
 To refresh or update the binaries:
 
@@ -94,11 +109,24 @@ This uses Microsoft's UEFI CA chain — no MOK enrollment needed.
 
 | File | Purpose |
 |------|---------|
-| `setup.sh` | Partitions, formats, and installs GRUB on the USB drive |
-| `update-grub.sh` | Scans ISOs and writes a static, Secure Boot-safe `grub.cfg` |
-| `grub.cfg` | Placeholder config — overwritten by `update-grub.sh` |
+| `setup.sh` | Partitions the drive, writes ISOs, installs GRUB, generates menu |
+| `add-iso.sh` | Adds an ISO to an existing drive without wiping |
+| `remove-iso.sh` | Removes an ISO partition and regenerates the menu |
+| `update-grub.sh` | Scans ISO partitions and rebuilds `grub.cfg` |
+| `grub.cfg` | Placeholder config — overwritten by setup.sh / update-grub.sh |
 | `download-efi.sh` | Downloads signed shim + GRUB EFI binaries from Ubuntu |
-| `MULTIBOOT_OPTIONS.md` | Design analysis comparing the three implementation approaches |
+| `MULTIBOOT_OPTIONS.md` | Design analysis comparing implementation approaches |
+
+## How it compares
+
+| Approach | Filesystem needed | Secure Boot | Distro-agnostic |
+|----------|------------------|-------------|-----------------|
+| Ventoy | Custom UEFI driver | Requires MOK | ✓ |
+| Loopback ISO (GRUB) | exFAT/NTFS | ✗ (insmod) | Partial |
+| Kernel extraction to ESP | FAT32 only | ✓ | Partial |
+| **Partition-per-ISO** (this) | **ISO9660 (built in)** | **✓** | Partial¹ |
+
+¹ Requires distro-specific kernel parameters, but detection is automatic for all major distros.
 
 ## License
 

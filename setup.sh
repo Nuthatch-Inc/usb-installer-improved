@@ -1,28 +1,39 @@
 #!/usr/bin/env bash
 #
-# setup.sh — Prepare a multi-boot USB drive (Option C: Hybrid)
+# setup.sh — Prepare a multi-boot USB drive (partition-per-ISO)
 #
 # Layout:
-#   Partition 1  4 GiB    FAT32   ESP (GRUB2 + shim + extracted kernels)
-#   Partition 2  *flex*   exFAT   Linux ISO storage
-#   Partition 3  8 GiB    NTFS    Extracted Windows 11 installer
+#   Partition 1        512 MiB  FAT32      ESP (shim + GRUB + grub.cfg)
+#   Partition 2..N     *auto*   ISO9660    Raw dd'd Linux ISOs
+#   Partition N+1      8 GiB    NTFS       Extracted Windows 11 (optional)
 #
-# The ESP must be large enough to hold the extracted vmlinuz + initrd
-# for every ISO (~110 MB per ISO). Ubuntu's signed GRUB cannot read
-# exFAT, so kernels are extracted to the FAT32 ESP by update-grub.sh.
+# Each Linux ISO is written raw (dd) into its own GPT partition.
+# The ISO9660 filesystem becomes directly readable by GRUB (which has
+# iso9660 built in), so GRUB loads each distro's kernel and initrd
+# straight from the ISO partition — no extraction needed, no exFAT
+# issues, no chainloading headaches.
+#
+# Chainloading (loading the ISO's own EFI bootloader) does NOT work
+# because UEFI firmware can only read FAT, not ISO9660. The
+# chainloaded binary wouldn't be able to find its config files.
+# Instead, our GRUB directly loads each distro's kernel+initrd from
+# the ISO9660 partition (which GRUB CAN read), then the distro's
+# initramfs locates its own squashfs on the same partition.
 #
 # Usage:
-#   sudo ./setup.sh /dev/sdX [--win-iso path/to/Win11.iso]
+#   sudo ./setup.sh /dev/sdX --iso ubuntu.iso --iso fedora.iso
+#   sudo ./setup.sh /dev/sdX --iso ubuntu.iso --win-iso Win11.iso
+#
+# To add ISOs later without wiping:
+#   sudo ./add-iso.sh /dev/sdX path/to/new.iso
 #
 # Secure Boot: Run ./download-efi.sh first to fetch signed shim + GRUB
-#              binaries into efi/. The script also falls back to system
-#              binaries or grub-install --force if efi/ is not populated.
+#              binaries into efi/. Falls back to system binaries or
+#              grub-install --force if efi/ is not populated.
 #
-# Dependencies are auto-installed for supported distros:
-#   Debian/Ubuntu, Fedora, RHEL/CentOS/Rocky, Arch, openSUSE, Void, Alpine
-# Manual installs need: sgdisk, mkfs.fat, mkfs.exfat, mkfs.ntfs (ntfs-3g),
-#                        grub-install (grub2-install on Fedora), 7z or bsdtar,
-#                        partprobe (parted)
+# Dependencies are auto-installed for supported distros.
+# Manual installs need: sgdisk, mkfs.fat, mkfs.ntfs (ntfs-3g),
+#                        7z or bsdtar (Windows only), partprobe (parted)
 
 set -euo pipefail
 
@@ -35,12 +46,31 @@ die()   { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; exit 1; }
 # ── Parse arguments ──────────────────────────────────────────────
 DEVICE=""
 WIN_ISO=""
+declare -a LINUX_ISOS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --win-iso) WIN_ISO="$2"; shift 2 ;;
+        --iso)
+            [[ -n "${2:-}" ]] || die "--iso requires a path argument"
+            LINUX_ISOS+=("$2"); shift 2 ;;
+        --win-iso)
+            [[ -n "${2:-}" ]] || die "--win-iso requires a path argument"
+            WIN_ISO="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: sudo $0 /dev/sdX [--win-iso path/to/Win11.iso]"
+            cat <<EOF
+Usage: sudo $0 /dev/sdX --iso path/to/linux.iso [--iso another.iso ...] [--win-iso path/to/Win11.iso]
+
+Options:
+  --iso PATH       Add a Linux ISO (can be repeated)
+  --win-iso PATH   Add a Windows 11 ISO (extracted to NTFS partition)
+  -h, --help       Show this help
+
+Example:
+  sudo $0 /dev/sdX \\
+      --iso ~/Downloads/ubuntu-26.04-desktop-amd64.iso \\
+      --iso ~/Downloads/Fedora-Workstation-Live-x86_64-42.iso \\
+      --win-iso ~/Downloads/Win11_24H2.iso
+EOF
             exit 0
             ;;
         *)
@@ -53,14 +83,54 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -n "$DEVICE" ]]       || die "No device specified.  Usage: sudo $0 /dev/sdX"
+[[ -n "$DEVICE" ]]       || die "No device specified.  Usage: sudo $0 /dev/sdX --iso path/to.iso"
 [[ -b "$DEVICE" ]]       || die "$DEVICE is not a block device"
 [[ "$(id -u)" -eq 0 ]]   || die "Must run as root (sudo)"
+
+if [[ ${#LINUX_ISOS[@]} -eq 0 && -z "$WIN_ISO" ]]; then
+    die "No ISOs specified. Use --iso and/or --win-iso."
+fi
+
+# Validate all ISOs exist up front
+for iso in "${LINUX_ISOS[@]}"; do
+    [[ -f "$iso" ]] || die "ISO not found: $iso"
+done
+if [[ -n "$WIN_ISO" ]]; then
+    [[ -f "$WIN_ISO" ]] || die "Windows ISO not found: $WIN_ISO"
+fi
 
 # ── Safety gate ──────────────────────────────────────────────────
 echo ""
 warn "This will DESTROY ALL DATA on $DEVICE"
 lsblk "$DEVICE"
+echo ""
+
+# Show planned layout
+DEVICE_SIZE_BYTES=$(blockdev --getsize64 "$DEVICE")
+DEVICE_SIZE_GIB=$(( DEVICE_SIZE_BYTES / 1024 / 1024 / 1024 ))
+info "Drive size: ${DEVICE_SIZE_GIB} GiB"
+info "Planned layout:"
+info "  Partition 1:  512 MiB  FAT32  ESP (GRUB bootloader)"
+
+PART_NUM=2
+TOTAL_MIB=512
+for iso in "${LINUX_ISOS[@]}"; do
+    iso_size_bytes=$(stat -c%s "$iso")
+    iso_size_mib=$(( (iso_size_bytes + 1048575) / 1048576 ))
+    info "  Partition $PART_NUM:  ${iso_size_mib} MiB  ISO9660  $(basename "$iso")"
+    TOTAL_MIB=$(( TOTAL_MIB + iso_size_mib ))
+    ((PART_NUM++))
+done
+if [[ -n "$WIN_ISO" ]]; then
+    info "  Partition $PART_NUM:  8192 MiB  NTFS  Windows 11"
+    TOTAL_MIB=$(( TOTAL_MIB + 8192 ))
+fi
+info "  Total used: ~$(( TOTAL_MIB / 1024 )) GiB of ${DEVICE_SIZE_GIB} GiB"
+
+if (( TOTAL_MIB > DEVICE_SIZE_GIB * 1024 )); then
+    die "ISOs exceed drive capacity (${TOTAL_MIB} MiB needed, $(( DEVICE_SIZE_GIB * 1024 )) MiB available)"
+fi
+
 echo ""
 read -r -p "Type YES to continue: " confirm
 [[ "$confirm" == "YES" ]] || { echo "Aborted."; exit 1; }
@@ -75,27 +145,20 @@ fi
 # ── Helper: forcefully unmount every partition on the device ─────
 unmount_device() {
     info "Unmounting any mounted partitions on $DEVICE..."
-
-    # 1) Unmount by device path (works even when lsblk can't resolve mounts)
     while IFS= read -r part; do
         [[ -n "$part" ]] && { umount -f "$part" 2>/dev/null || umount -l "$part" 2>/dev/null || true; }
     done < <(lsblk -rno NAME "$DEVICE" 2>/dev/null | awk 'NR>1{print "/dev/" $1}')
-
-    # 2) Also unmount by mountpoint (catches stale/orphaned mounts)
     while IFS= read -r mp; do
         [[ -n "$mp" ]] && { umount -f "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true; }
     done < <(lsblk -rno MOUNTPOINTS "$DEVICE" 2>/dev/null)
-
-    # 3) Verify — if anything is still mounted, abort rather than corrupt data
     local remaining
     remaining=$(lsblk -rno MOUNTPOINTS "$DEVICE" 2>/dev/null | grep -c '[^[:space:]]' || true)
     if [[ "$remaining" -gt 0 ]]; then
-        warn "Some partitions are still mounted — attempting to kill holders..."
+        warn "Some partitions still mounted — killing holders..."
         while IFS= read -r part; do
             [[ -n "$part" ]] && fuser -km "/dev/$part" 2>/dev/null || true
         done < <(lsblk -rno NAME "$DEVICE" 2>/dev/null | tail -n +2)
         sleep 1
-        # Final lazy unmount sweep
         while IFS= read -r mp; do
             [[ -n "$mp" ]] && { umount -l "$mp" 2>/dev/null || true; }
         done < <(lsblk -rno MOUNTPOINTS "$DEVICE" 2>/dev/null)
@@ -122,98 +185,76 @@ install_deps() {
     distro="$(detect_distro)"
     info "Detected Linux distribution: $distro"
 
-    # Base packages needed for all runs
     local -a base_pkgs=()
-    # Extra packages needed only for Windows ISO extraction
     local -a win_pkgs=()
 
     case "$distro" in
         ubuntu|debian|linuxmint|pop|elementary|zorin|kali|neon)
-            base_pkgs=(gdisk dosfstools exfatprogs parted util-linux grub-efi-amd64-bin)
+            base_pkgs=(gdisk dosfstools parted util-linux grub-efi-amd64-bin)
             win_pkgs=(ntfs-3g p7zip-full)
             PKGMGR="apt"
             ;;
         fedora)
-            base_pkgs=(gdisk dosfstools exfatprogs parted util-linux grub2-efi-x64 grub2-efi-x64-modules)
+            base_pkgs=(gdisk dosfstools parted util-linux grub2-efi-x64 grub2-efi-x64-modules)
             win_pkgs=(ntfs-3g p7zip p7zip-plugins)
             PKGMGR="dnf"
             ;;
         rhel|centos|rocky|alma|ol)
-            base_pkgs=(gdisk dosfstools exfatprogs parted util-linux grub2-efi-x64 grub2-efi-x64-modules)
+            base_pkgs=(gdisk dosfstools parted util-linux grub2-efi-x64 grub2-efi-x64-modules)
             win_pkgs=(ntfs-3g p7zip p7zip-plugins)
             PKGMGR="dnf"
             ;;
         opensuse*|suse|sles)
-            base_pkgs=(gptfdisk dosfstools exfatprogs parted util-linux grub2-x86_64-efi)
+            base_pkgs=(gptfdisk dosfstools parted util-linux grub2-x86_64-efi)
             win_pkgs=(ntfs-3g p7zip)
             PKGMGR="zypper"
             ;;
         arch|manjaro|endeavouros|garuda|cachyos)
-            base_pkgs=(gptfdisk dosfstools exfatprogs parted util-linux grub)
+            base_pkgs=(gptfdisk dosfstools parted util-linux grub)
             win_pkgs=(ntfs-3g p7zip)
             PKGMGR="pacman"
             ;;
         void)
-            base_pkgs=(gptfdisk dosfstools exfatprogs parted util-linux grub-x86_64-efi)
+            base_pkgs=(gptfdisk dosfstools parted util-linux grub-x86_64-efi)
             win_pkgs=(ntfs-3g p7zip)
             PKGMGR="xbps"
             ;;
         alpine)
-            base_pkgs=(gptfdisk dosfstools exfatprogs parted util-linux grub-efi)
+            base_pkgs=(gptfdisk dosfstools parted util-linux grub-efi)
             win_pkgs=(ntfs-3g-progs p7zip)
             PKGMGR="apk"
             ;;
         *)
             warn "Unrecognised distro '$distro' — skipping automatic dependency install."
-            warn "Please ensure the following are installed: sgdisk mkfs.fat mkfs.exfat wipefs lsblk grub-install partprobe"
-            [[ -n "$WIN_ISO" ]] && warn "For Windows ISO support also install: mkfs.ntfs, 7z or bsdtar"
+            warn "Please ensure: sgdisk mkfs.fat wipefs lsblk partprobe blkid dd"
+            [[ -n "$WIN_ISO" ]] && warn "For Windows: mkfs.ntfs, 7z or bsdtar"
             return 0
             ;;
     esac
 
-    # Merge win_pkgs if a Windows ISO was supplied
     local -a all_pkgs=("${base_pkgs[@]}")
-    if [[ -n "$WIN_ISO" ]]; then
-        all_pkgs+=("${win_pkgs[@]}")
-    fi
+    [[ -n "$WIN_ISO" ]] && all_pkgs+=("${win_pkgs[@]}")
 
     info "Installing dependencies via $PKGMGR: ${all_pkgs[*]}"
     case "$PKGMGR" in
-        apt)
-            apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${all_pkgs[@]}"
-            ;;
-        dnf)
-            dnf install -y --quiet "${all_pkgs[@]}"
-            ;;
-        zypper)
-            zypper --non-interactive install --no-confirm "${all_pkgs[@]}"
-            ;;
-        pacman)
-            pacman -Sy --noconfirm --needed "${all_pkgs[@]}"
-            ;;
-        xbps)
-            xbps-install -Sy "${all_pkgs[@]}"
-            ;;
-        apk)
-            apk add --quiet "${all_pkgs[@]}"
-            ;;
+        apt)    apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${all_pkgs[@]}" ;;
+        dnf)    dnf install -y --quiet "${all_pkgs[@]}" ;;
+        zypper) zypper --non-interactive install --no-confirm "${all_pkgs[@]}" ;;
+        pacman) pacman -Sy --noconfirm --needed "${all_pkgs[@]}" ;;
+        xbps)   xbps-install -Sy "${all_pkgs[@]}" ;;
+        apk)    apk add --quiet "${all_pkgs[@]}" ;;
     esac
-
     info "Dependencies installed successfully."
 }
 
 install_deps
 
-# ── Dependency checks (verify everything is actually available) ──
-for cmd in sgdisk mkfs.fat mkfs.exfat wipefs lsblk partprobe; do
+# ── Dependency checks ────────────────────────────────────────────
+for cmd in sgdisk mkfs.fat wipefs lsblk partprobe blkid dd; do
     command -v "$cmd" >/dev/null || die "Required command not found: $cmd"
 done
 
-command -v blkid >/dev/null || die "Required command not found: blkid"
-
 if [[ -n "$WIN_ISO" ]]; then
-    [[ -f "$WIN_ISO" ]] || die "Windows ISO not found: $WIN_ISO"
     command -v mkfs.ntfs >/dev/null || die "mkfs.ntfs not found (install ntfs-3g)"
     if command -v 7z >/dev/null; then
         EXTRACT_CMD="7z"
@@ -224,7 +265,7 @@ if [[ -n "$WIN_ISO" ]]; then
     fi
 fi
 
-# Detect grub-install binary name (Fedora uses grub2-install)
+# Detect grub-install binary
 if command -v grub-install >/dev/null; then
     GRUB_INSTALL="grub-install"
 elif command -v grub2-install >/dev/null; then
@@ -234,7 +275,6 @@ else
 fi
 
 # ── Locate signed Secure Boot binaries ───────────────────────────
-# Priority: 1) bundled efi/  2) system paths  3) grub-install --force
 find_first() {
     for path in "$@"; do
         [[ -f "$path" ]] && { echo "$path"; return 0; }
@@ -244,175 +284,162 @@ find_first() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUNDLED_EFI="$SCRIPT_DIR/efi/boot"
-BUNDLED_MODS="$SCRIPT_DIR/efi/grub-modules"
 
 SHIM_EFI=""
 GRUB_EFI=""
 MM_EFI=""
-GRUB_MODULES_DIR=""
 
-# 1) Bundled binaries (from download-efi.sh)
 SHIM_EFI=$(find_first "$BUNDLED_EFI/BOOTX64.EFI") || true
 GRUB_EFI=$(find_first "$BUNDLED_EFI/grubx64.efi") || true
 MM_EFI=$(find_first   "$BUNDLED_EFI/mmx64.efi")   || true
-[[ -d "$BUNDLED_MODS" ]] && GRUB_MODULES_DIR="$BUNDLED_MODS"
-
-if [[ -n "$SHIM_EFI" && -n "$GRUB_EFI" ]]; then
-    info "Using bundled Secure Boot binaries from efi/boot/"
-else
-    # 2) System-installed binaries
-    SHIM_EFI=$(find_first \
-        /boot/efi/EFI/fedora/shimx64.efi \
-        /boot/efi/EFI/redhat/shimx64.efi \
-        /boot/efi/EFI/centos/shimx64.efi \
-        /usr/lib/shim/shimx64.efi.signed \
-        /usr/lib/shim/shimx64.efi \
-        /usr/share/efi/x86_64/shim.efi \
-        /boot/efi/EFI/opensuse/shim.efi) || true
-
-    GRUB_EFI=$(find_first \
-        /boot/efi/EFI/fedora/grubx64.efi \
-        /boot/efi/EFI/redhat/grubx64.efi \
-        /boot/efi/EFI/centos/grubx64.efi \
-        /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed \
-        /usr/lib/grub/x86_64-efi-signed/grubx64.efi \
-        /boot/efi/EFI/opensuse/grubx64.efi) || true
-
-    MM_EFI=$(find_first \
-        /boot/efi/EFI/fedora/mmx64.efi \
-        /boot/efi/EFI/redhat/mmx64.efi \
-        /boot/efi/EFI/centos/mmx64.efi) || true
-fi
-
-# Locate GRUB modules directory (bundled or system)
-if [[ -z "$GRUB_MODULES_DIR" ]]; then
-    for d in /usr/lib/grub/x86_64-efi /usr/lib64/grub/x86_64-efi /usr/share/grub2/x86_64-efi; do
-        [[ -d "$d" ]] && { GRUB_MODULES_DIR="$d"; break; }
-    done
-fi
 
 if [[ -n "$SHIM_EFI" && -n "$GRUB_EFI" ]]; then
     USE_SHIM=true
-    info "Secure Boot binaries:"
-    info "  shim:  $SHIM_EFI"
-    info "  grub:  $GRUB_EFI"
-    [[ -n "$MM_EFI" ]]         && info "  mokm:  $MM_EFI"
-    [[ -n "$GRUB_MODULES_DIR" ]] && info "  mods:  $GRUB_MODULES_DIR"
-elif [[ -n "$GRUB_INSTALL" ]]; then
-    USE_SHIM=false
-    warn "Signed shim/GRUB not found — will use $GRUB_INSTALL --force"
-    warn "Secure Boot will NOT be supported. Run ./download-efi.sh first for Secure Boot."
+    info "Using bundled Secure Boot binaries from efi/boot/"
 else
-    die "No signed EFI binaries and no grub-install found. Run ./download-efi.sh first."
+    SHIM_EFI=$(find_first \
+        /boot/efi/EFI/fedora/shimx64.efi \
+        /boot/efi/EFI/redhat/shimx64.efi \
+        /usr/lib/shim/shimx64.efi.signed \
+        /usr/lib/shim/shimx64.efi \
+        /boot/efi/EFI/opensuse/shim.efi) || true
+    GRUB_EFI=$(find_first \
+        /boot/efi/EFI/fedora/grubx64.efi \
+        /boot/efi/EFI/redhat/grubx64.efi \
+        /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed \
+        /usr/lib/grub/x86_64-efi-signed/grubx64.efi \
+        /boot/efi/EFI/opensuse/grubx64.efi) || true
+    MM_EFI=$(find_first \
+        /boot/efi/EFI/fedora/mmx64.efi \
+        /boot/efi/EFI/redhat/mmx64.efi) || true
+
+    if [[ -n "$SHIM_EFI" && -n "$GRUB_EFI" ]]; then
+        USE_SHIM=true
+        info "Using system Secure Boot binaries"
+    elif [[ -n "$GRUB_INSTALL" ]]; then
+        USE_SHIM=false
+        warn "Signed shim/GRUB not found — will use $GRUB_INSTALL --force"
+        warn "Secure Boot will NOT be supported. Run ./download-efi.sh first."
+    else
+        die "No signed EFI binaries and no grub-install found. Run ./download-efi.sh first."
+    fi
 fi
 
-# ── Compute partition sizes ──────────────────────────────────────
-ESP_SIZE_MIB=4096  # 4 GiB — holds GRUB + extracted kernels/initrds (~110 MB per ISO)
-WIN_SIZE_MIB=8192  # 8 GiB — enough for any Windows 11 ISO
-
-# ── Save existing partition device paths before wiping ───────────
+# ── Save old partitions & unmount ────────────────────────────────
 mapfile -t OLD_PARTS < <(lsblk -rno NAME "$DEVICE" 2>/dev/null | tail -n +2 | awk '{print "/dev/" $1}')
 
-# ── Partition the drive ──────────────────────────────────────────
+# ── Wipe and partition ───────────────────────────────────────────
 info "Wiping and partitioning $DEVICE..."
 wipefs --all --force "$DEVICE"
 sgdisk --zap-all "$DEVICE"
 
+# Partition 1: ESP (512 MiB — only holds GRUB + config, no kernel extraction)
+ESP_SIZE_MIB=512
+sgdisk -n "1:0:+${ESP_SIZE_MIB}M" -t 1:ef00 -c 1:"ESP" "$DEVICE"
+
+# Partitions 2..N: one per Linux ISO, sized exactly to the ISO
+PART_NUM=2
+declare -A ISO_PARTMAP=()   # maps partition number → ISO path
+for iso in "${LINUX_ISOS[@]}"; do
+    iso_name="$(basename "$iso" .iso)"
+    iso_size_bytes=$(stat -c%s "$iso")
+    iso_size_mib=$(( (iso_size_bytes + 1048575) / 1048576 ))  # round up
+
+    info "  Partition $PART_NUM: ${iso_size_mib} MiB for $(basename "$iso")"
+    sgdisk -n "${PART_NUM}:0:+${iso_size_mib}M" \
+           -t "${PART_NUM}:8300" \
+           -c "${PART_NUM}:${iso_name}" \
+           "$DEVICE"
+
+    ISO_PARTMAP[$PART_NUM]="$iso"
+    ((PART_NUM++))
+done
+
+# Optional Windows partition (last, 8 GiB)
+WIN_PART_NUM=""
 if [[ -n "$WIN_ISO" ]]; then
-    # 3-partition layout: ESP + Linux ISOs + Windows
-    sgdisk \
-        -n "1:0:+${ESP_SIZE_MIB}M" -t 1:ef00 -c 1:"ESP" \
-        -n "3:0:+${WIN_SIZE_MIB}M" -t 3:0700 -c 3:"Windows11" \
-        -n "2:0:0"                  -t 2:0700 -c 2:"LinuxISOs" \
-        "$DEVICE"
-else
-    # 2-partition layout: ESP + Linux ISOs
-    sgdisk \
-        -n "1:0:+${ESP_SIZE_MIB}M" -t 1:ef00 -c 1:"ESP" \
-        -n "2:0:0"                  -t 2:0700 -c 2:"LinuxISOs" \
-        "$DEVICE"
+    WIN_SIZE_MIB=8192
+    info "  Partition $PART_NUM: ${WIN_SIZE_MIB} MiB for Windows 11"
+    sgdisk -n "${PART_NUM}:0:+${WIN_SIZE_MIB}M" \
+           -t "${PART_NUM}:0700" \
+           -c "${PART_NUM}:Windows11" \
+           "$DEVICE"
+    WIN_PART_NUM=$PART_NUM
 fi
 
-# Re-read the partition table and let the kernel settle
+# Re-read partition table
 partprobe "$DEVICE" 2>/dev/null || sleep 2
 udevadm settle 2>/dev/null || sleep 2
 
-# Force-unmount the OLD partition paths saved before repartitioning.
-# After sgdisk + partprobe the new /dev/sdX1 is a different partition,
-# but the kernel may still hold a stale mount from the old /dev/sdX1.
-info "Releasing stale mounts from previous partition table..."
+# Release stale mounts
+info "Releasing stale mounts..."
 for old_part in "${OLD_PARTS[@]}"; do
     umount -f "$old_part" 2>/dev/null || umount -l "$old_part" 2>/dev/null || true
 done
-
-# Also run the general unmount helper for any automounter remounts
 unmount_device
 sleep 1
 
-# Final safety check — bail out if anything is still mounted
 if lsblk -rno MOUNTPOINTS "$DEVICE" 2>/dev/null | grep -q '[^[:space:]]'; then
-    die "Failed to unmount all partitions on $DEVICE. Please unmount manually and retry."
+    die "Failed to unmount all partitions. Please unmount manually and retry."
 fi
 
-# ── Format partitions ────────────────────────────────────────────
+# ── Format ESP ───────────────────────────────────────────────────
 info "Formatting ESP (FAT32)..."
 mkfs.fat -F32 -n "ESP" "${PART_PREFIX}1"
 
-info "Formatting Linux ISO partition (exFAT)..."
-mkfs.exfat -n "LINUXISOS" "${PART_PREFIX}2"
+# ── Write ISOs to their partitions ───────────────────────────────
+for part_num in $(echo "${!ISO_PARTMAP[@]}" | tr ' ' '\n' | sort -n); do
+    iso="${ISO_PARTMAP[$part_num]}"
+    target="${PART_PREFIX}${part_num}"
+    iso_name="$(basename "$iso")"
+    iso_size_bytes=$(stat -c%s "$iso")
+    iso_size_mib=$(( iso_size_bytes / 1048576 ))
 
-if [[ -n "$WIN_ISO" ]]; then
+    info "Writing $iso_name → $target (${iso_size_mib} MiB)..."
+    dd if="$iso" of="$target" bs=4M status=progress conv=fsync 2>&1
+    info "  ✓ $iso_name written"
+done
+
+# ── Format and extract Windows ───────────────────────────────────
+MNT_WIN=""
+if [[ -n "$WIN_ISO" && -n "$WIN_PART_NUM" ]]; then
+    win_dev="${PART_PREFIX}${WIN_PART_NUM}"
     info "Formatting Windows partition (NTFS)..."
-    mkfs.ntfs -f -L "WIN11" "${PART_PREFIX}3"
+    mkfs.ntfs -f -L "WIN11" "$win_dev"
+
+    MNT_WIN=$(mktemp -d)
+    mount "$win_dev" "$MNT_WIN"
+
+    info "Extracting Windows 11 ISO (this may take a few minutes)..."
+    case "$EXTRACT_CMD" in
+        7z)     7z x "$WIN_ISO" -o"$MNT_WIN" -bso0 -bsp1 ;;
+        bsdtar) bsdtar xf "$WIN_ISO" -C "$MNT_WIN" ;;
+    esac
+    info "  ✓ Windows extraction complete"
 fi
 
-# Capture filesystem UUIDs so GRUB can target this USB explicitly
-ESP_UUID="$(blkid -s UUID -o value "${PART_PREFIX}1" || true)"
-ISO_UUID="$(blkid -s UUID -o value "${PART_PREFIX}2" || true)"
-[[ -n "$ESP_UUID" ]] || die "Could not read UUID for ${PART_PREFIX}1 (ESP)"
-[[ -n "$ISO_UUID" ]] || die "Could not read UUID for ${PART_PREFIX}2 (LINUXISOS)"
-
-if [[ -n "$WIN_ISO" ]]; then
-    WIN_UUID="$(blkid -s UUID -o value "${PART_PREFIX}3" || true)"
-    [[ -n "$WIN_UUID" ]] || die "Could not read UUID for ${PART_PREFIX}3 (WIN11)"
-else
-    WIN_UUID=""
-fi
-
-# ── Mount points ─────────────────────────────────────────────────
+# ── Install GRUB to ESP ─────────────────────────────────────────
 MNT_ESP=$(mktemp -d)
-MNT_ISO=$(mktemp -d)
 
 cleanup() {
-    info "Syncing cached writes to USB (this may take a while for large files)..."
+    info "Syncing cached writes..."
     sync
-    info "Unmounting partitions..."
-    umount "$MNT_ESP"  2>/dev/null || true
-    umount "$MNT_ISO"  2>/dev/null || true
-    [[ -n "${MNT_WIN:-}" ]] && umount "$MNT_WIN" 2>/dev/null || true
-    rmdir "$MNT_ESP" "$MNT_ISO" ${MNT_WIN:+"$MNT_WIN"} 2>/dev/null || true
+    info "Unmounting..."
+    umount "$MNT_ESP" 2>/dev/null || true
+    [[ -n "$MNT_WIN" ]] && { umount "$MNT_WIN" 2>/dev/null || true; }
+    rmdir "$MNT_ESP" 2>/dev/null || true
+    [[ -n "$MNT_WIN" ]] && { rmdir "$MNT_WIN" 2>/dev/null || true; }
 }
 trap cleanup EXIT
 
 mount "${PART_PREFIX}1" "$MNT_ESP"
-mount "${PART_PREFIX}2" "$MNT_ISO"
 
-# ── Install GRUB ─────────────────────────────────────────────────
 if $USE_SHIM; then
     info "Installing signed shim + GRUB to ESP (Secure Boot compatible)..."
     mkdir -p "$MNT_ESP/EFI/BOOT"
-
-    # shimx64.efi → BOOTX64.EFI  (this is what the firmware loads on removable media)
     cp "$SHIM_EFI" "$MNT_ESP/EFI/BOOT/BOOTX64.EFI"
-    # signed grubx64.efi beside the shim (shim chainloads this by name)
     cp "$GRUB_EFI" "$MNT_ESP/EFI/BOOT/grubx64.efi"
-    # MOK manager (optional, lets users enrol keys at boot)
     [[ -n "$MM_EFI" ]] && cp "$MM_EFI" "$MNT_ESP/EFI/BOOT/mmx64.efi"
-
-    # NOTE: GRUB modules are NOT copied to the ESP. Ubuntu's signed
-    # grubx64.efi has all required modules (loopback, iso9660, linux,
-    # chain, search, regexp, etc.) built in. Loading .mod files from
-    # disk under Secure Boot causes signature-verification errors.
 else
     info "Installing GRUB to ESP (without Secure Boot)..."
     $GRUB_INSTALL \
@@ -424,36 +451,226 @@ else
         --force
 fi
 
-# ── Write GRUB config ────────────────────────────────────────────
-info "Writing GRUB configuration..."
-GRUB_CFG_SRC="$SCRIPT_DIR/grub.cfg"
+# ── Generate grub.cfg ───────────────────────────────────────────
+info "Generating grub.cfg..."
+ESP_UUID="$(blkid -s UUID -o value "${PART_PREFIX}1" || true)"
+[[ -n "$ESP_UUID" ]] || die "Could not read UUID for ESP"
 
 mkdir -p "$MNT_ESP/boot/grub"
+GRUB_CFG="$MNT_ESP/boot/grub/grub.cfg"
 
-if [[ -f "$GRUB_CFG_SRC" ]]; then
-    cp "$GRUB_CFG_SRC" "$MNT_ESP/boot/grub/grub.cfg"
-else
-    warn "grub.cfg not found alongside this script — writing a minimal stub"
-    cat > "$MNT_ESP/boot/grub/grub.cfg" <<'GRUBEOF'
+# We need to probe each ISO partition for its distro type and
+# filesystem UUID/label, then generate appropriate menu entries.
+# This is the same logic as update-grub.sh but run inline.
+
+MNT_PROBE=$(mktemp -d)
+
+detect_iso_distro() {
+    local mnt="$1"
+    if [[ -f "$mnt/casper/vmlinuz" ]]; then
+        echo "casper"
+    elif [[ -f "$mnt/images/pxeboot/vmlinuz" ]]; then
+        echo "fedora"
+    elif [[ -f "$mnt/live/vmlinuz" ]]; then
+        echo "debian-live"
+    elif [[ -f "$mnt/arch/boot/x86_64/vmlinuz-linux" ]]; then
+        echo "arch"
+    elif [[ -f "$mnt/boot/x86_64/loader/linux" ]]; then
+        echo "opensuse"
+    else
+        echo "unknown"
+    fi
+}
+
+pretty_name() {
+    local name="$1"
+    name="${name%.iso}"
+    name="${name//-/ }"
+    name="${name//_/ }"
+    echo "$name"
+}
+
+# Start writing grub.cfg
+cat > "$GRUB_CFG" <<HEADER
+# GRUB2 configuration for multi-boot USB (partition-per-ISO)
+#
+# Auto-generated by setup.sh on $(date '+%Y-%m-%d %H:%M:%S')
+# Re-run update-grub.sh after adding/removing ISOs.
+#
+# Each Linux ISO lives in its own GPT partition (raw dd).
+# GRUB reads the kernel and initrd directly from the ISO9660
+# filesystem (which is built into the signed grubx64.efi).
+# No insmod lines — fully Secure Boot compatible.
+
 set timeout=30
 set default=0
 
-menuentry ">>> Run update-grub.sh to detect ISOs <<<" {
-    echo "No ISOs have been registered yet."
-    echo "Copy .iso files to isos/ on the LINUXISOS partition, then run:"
-    echo "  sudo ./update-grub.sh /dev/sdX"
-    sleep 15
+HEADER
+
+ENTRY_COUNT=0
+
+for part_num in $(echo "${!ISO_PARTMAP[@]}" | tr ' ' '\n' | sort -n); do
+    iso="${ISO_PARTMAP[$part_num]}"
+    target="${PART_PREFIX}${part_num}"
+    filename="$(basename "$iso")"
+    label="$(pretty_name "$filename")"
+
+    # Get the filesystem UUID from the dd'd ISO partition
+    fs_uuid="$(blkid -s UUID -o value "$target" 2>/dev/null || true)"
+    if [[ -z "$fs_uuid" ]]; then
+        warn "  Could not get filesystem UUID for $target — skipping"
+        continue
+    fi
+
+    # Mount the ISO partition to detect distro layout
+    mount -o ro "$target" "$MNT_PROBE" 2>/dev/null || {
+        warn "  Could not mount $target — skipping"
+        continue
+    }
+
+    dtype="$(detect_iso_distro "$MNT_PROBE")"
+    info "  $filename → partition $part_num ($dtype), UUID=$fs_uuid"
+    umount "$MNT_PROBE" 2>/dev/null || true
+
+    case "$dtype" in
+        casper)
+            cat >> "$GRUB_CFG" <<ENTRY
+menuentry "$label" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/casper/vmlinuz boot=casper quiet splash ---
+    initrd (\$isopart)/casper/initrd
 }
 
-menuentry "UEFI Firmware Settings" { fwsetup }
-menuentry "Reboot" { reboot }
-menuentry "Power Off" { halt }
-GRUBEOF
+menuentry "$label  (safe graphics)" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/casper/vmlinuz boot=casper quiet splash nomodeset ---
+    initrd (\$isopart)/casper/initrd
+}
+
+ENTRY
+            ;;
+        fedora)
+            cat >> "$GRUB_CFG" <<ENTRY
+menuentry "$label" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/images/pxeboot/vmlinuz root=live:UUID=$fs_uuid rd.live.image quiet
+    initrd (\$isopart)/images/pxeboot/initrd.img
+}
+
+menuentry "$label  (basic graphics)" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/images/pxeboot/vmlinuz root=live:UUID=$fs_uuid rd.live.image nomodeset quiet
+    initrd (\$isopart)/images/pxeboot/initrd.img
+}
+
+ENTRY
+            ;;
+        debian-live)
+            cat >> "$GRUB_CFG" <<ENTRY
+menuentry "$label" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/live/vmlinuz boot=live components quiet splash ---
+    initrd (\$isopart)/live/initrd.img
+}
+
+menuentry "$label  (safe graphics)" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/live/vmlinuz boot=live components quiet splash nomodeset ---
+    initrd (\$isopart)/live/initrd.img
+}
+
+ENTRY
+            ;;
+        arch)
+            cat >> "$GRUB_CFG" <<ENTRY
+menuentry "$label" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/arch/boot/x86_64/vmlinuz-linux archisodevice=/dev/disk/by-uuid/$fs_uuid
+    initrd (\$isopart)/arch/boot/x86_64/initramfs-linux.img
+}
+
+menuentry "$label  (safe graphics)" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/arch/boot/x86_64/vmlinuz-linux archisodevice=/dev/disk/by-uuid/$fs_uuid nomodeset
+    initrd (\$isopart)/arch/boot/x86_64/initramfs-linux.img
+}
+
+ENTRY
+            ;;
+        opensuse)
+            cat >> "$GRUB_CFG" <<ENTRY
+menuentry "$label" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/boot/x86_64/loader/linux root=live:UUID=$fs_uuid splash=silent quiet
+    initrd (\$isopart)/boot/x86_64/loader/initrd
+}
+
+menuentry "$label  (safe graphics)" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/boot/x86_64/loader/linux root=live:UUID=$fs_uuid splash=silent quiet nomodeset
+    initrd (\$isopart)/boot/x86_64/loader/initrd
+}
+
+ENTRY
+            ;;
+        *)
+            warn "  Unrecognised ISO layout for $filename — trying casper fallback"
+            cat >> "$GRUB_CFG" <<ENTRY
+menuentry "$label  (unrecognised — casper fallback)" {
+    search --no-floppy --fs-uuid --set=isopart $fs_uuid
+    linux (\$isopart)/casper/vmlinuz boot=casper quiet splash ---
+    initrd (\$isopart)/casper/initrd
+}
+
+ENTRY
+            ;;
+    esac
+
+    ((ENTRY_COUNT++)) || true
+done
+
+rmdir "$MNT_PROBE" 2>/dev/null || true
+
+# Windows entry
+if [[ -n "$WIN_ISO" && -n "$WIN_PART_NUM" ]]; then
+    win_dev="${PART_PREFIX}${WIN_PART_NUM}"
+    win_uuid="$(blkid -s UUID -o value "$win_dev" 2>/dev/null || true)"
+    if [[ -n "$win_uuid" ]]; then
+        info "  ✓ Windows 11 → partition $WIN_PART_NUM"
+        cat >> "$GRUB_CFG" <<WINENTRY
+# ══════════════════════════════════════════════════════════════════
+#  Windows 11
+# ══════════════════════════════════════════════════════════════════
+
+menuentry "Windows 11 Installer" {
+    search --no-floppy --fs-uuid --set=winpart $win_uuid
+    chainloader (\$winpart)/efi/boot/bootx64.efi
+}
+
+WINENTRY
+    fi
 fi
 
-# When using signed shim, the GRUB binary looks for grub.cfg relative to
-# its own location (EFI/BOOT/) before /boot/grub/.  Place a small redirect
-# so it always finds the real config.
+# Utility entries
+cat >> "$GRUB_CFG" <<'UTILS'
+# ══════════════════════════════════════════════════════════════════
+#  Utilities
+# ══════════════════════════════════════════════════════════════════
+
+menuentry "UEFI Firmware Settings" {
+    fwsetup
+}
+
+menuentry "Reboot" {
+    reboot
+}
+
+menuentry "Power Off" {
+    halt
+}
+UTILS
+
+# Shim redirect config — GRUB looks for grub.cfg next to itself first
 if $USE_SHIM; then
     mkdir -p "$MNT_ESP/EFI/BOOT"
     cat > "$MNT_ESP/EFI/BOOT/grub.cfg" <<SHIMCFG
@@ -461,35 +678,26 @@ search --no-floppy --fs-uuid --set=esp ${ESP_UUID}
 set prefix=(\$esp)/boot/grub
 configfile (\$esp)/boot/grub/grub.cfg
 SHIMCFG
-    info "Wrote shim redirect config to EFI/BOOT/grub.cfg"
+    info "Wrote shim redirect to EFI/BOOT/grub.cfg"
 fi
 
-# ── Create directory structure on ISO partition ──────────────────
-mkdir -p "$MNT_ISO/isos"
-
-# ── Extract Windows ISO ──────────────────────────────────────────
-if [[ -n "$WIN_ISO" ]]; then
-    MNT_WIN=$(mktemp -d)
-    mount "${PART_PREFIX}3" "$MNT_WIN"
-    info "Extracting Windows 11 ISO to NTFS partition (this may take a few minutes)..."
-    case "$EXTRACT_CMD" in
-        7z)     7z x "$WIN_ISO" -o"$MNT_WIN" -bso0 -bsp1 ;;
-        bsdtar) bsdtar xf "$WIN_ISO" -C "$MNT_WIN" ;;
-    esac
-    info "Windows extraction complete."
-fi
-
-# ── Done ─────────────────────────────────────────────────────────
+# ── Summary ──────────────────────────────────────────────────────
+sync
 echo ""
 info "========================================="
 info " Multi-boot USB drive is ready!"
 info "========================================="
 info ""
-info "Next steps:"
-info "  1. Copy Linux ISO files into the 'isos/' folder on the LINUXISOS partition."
-info "  2. Run: sudo ./update-grub.sh $DEVICE"
-info "     This scans your ISOs and writes a static, Secure Boot-safe GRUB menu."
-info "  3. Boot from the USB drive."
-info ""
-info "Re-run update-grub.sh whenever you add, remove, or rename ISOs."
+info "Partition layout:"
+lsblk -o NAME,SIZE,FSTYPE,PARTLABEL "$DEVICE"
+echo ""
+info "$ENTRY_COUNT Linux ISO(s) installed."
+info "Menu entries:"
+grep -oP '(?<=menuentry ").*(?=")' "$GRUB_CFG" | while IFS= read -r entry; do
+    info "  • $entry"
+done
+echo ""
+info "To add more ISOs later:   sudo ./add-iso.sh $DEVICE path/to/new.iso"
+info "To remove an ISO:         sudo ./remove-iso.sh $DEVICE <partition-number>"
+info "To rebuild the GRUB menu: sudo ./update-grub.sh $DEVICE"
 echo ""
