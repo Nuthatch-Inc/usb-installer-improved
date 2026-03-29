@@ -12,6 +12,13 @@
 # The generated grub.cfg uses ONLY modules built into Ubuntu's signed
 # grubx64.efi (no insmod lines), so it is fully Secure Boot compatible.
 #
+# Note: Ubuntu's signed GRUB only has FAT/ext2/btrfs/iso9660 built
+# in — it CANNOT read the exFAT LINUXISOS partition.  This script
+# extracts vmlinuz + initrd from each ISO into boot/kernels/<slug>/
+# on the ESP (FAT32), which GRUB can always read.  The running Linux
+# kernel has its own exFAT driver and locates each ISO at boot time
+# via iso-scan/filename (or equivalent kernel parameter).
+#
 # Supported distro families (auto-detected by mounting each ISO):
 #   - Ubuntu / Mint / Pop!_OS / elementary   (casper)
 #   - Fedora / RHEL / CentOS / Rocky / Alma  (Anaconda / pxeboot)
@@ -67,6 +74,9 @@ WIN_DEV="${PART_PREFIX}3"
 [[ -b "$ISO_DEV" ]] || die "ISO partition not found: $ISO_DEV"
 
 # ── Get UUIDs ────────────────────────────────────────────────────
+ESP_UUID="$(blkid -s UUID -o value "$ESP_DEV" 2>/dev/null || true)"
+[[ -n "$ESP_UUID" ]] || die "Could not read UUID for $ESP_DEV"
+
 ISO_UUID="$(blkid -s UUID -o value "$ISO_DEV" 2>/dev/null || true)"
 [[ -n "$ISO_UUID" ]] || die "Could not read UUID for $ISO_DEV"
 
@@ -129,6 +139,27 @@ pretty_name() {
 
 info "Scanning ISOs in $MNT_ISO/isos/..."
 
+# ── Prepare extraction directory for kernels/initrds ─────────────
+# Ubuntu's signed GRUB has only FAT/ext2/btrfs/iso9660 built in —
+# no exFAT and no NTFS.  The LINUXISOS partition is exFAT, so GRUB
+# cannot read it at all.  We therefore extract vmlinuz + initrd to
+# the ESP (FAT32), which GRUB can always access.  The running Linux
+# kernel has its own exFAT driver and locates the ISO at runtime via
+# iso-scan/filename (or equivalent kernel parameter).
+BOOT_DIR="$MNT_ESP/boot/kernels"
+if [[ -d "$BOOT_DIR" ]]; then
+    info "Cleaning previous kernel extractions..."
+    rm -rf "$BOOT_DIR"
+fi
+mkdir -p "$BOOT_DIR"
+
+# Warn if ESP is getting tight (kernels ~110 MB per ISO)
+ESP_AVAIL_KB=$(df -k --output=avail "$MNT_ESP" | tail -1)
+if (( ESP_AVAIL_KB < 150000 )); then
+    warn "Less than 150 MB free on the ESP — some ISOs may not fit."
+    warn "Consider increasing the ESP size in setup.sh if you need many ISOs."
+fi
+
 for iso in "$MNT_ISO"/isos/*.iso; do
     [[ -f "$iso" ]] || continue
 
@@ -138,99 +169,110 @@ for iso in "$MNT_ISO"/isos/*.iso; do
 
     info "  Found: $filename"
 
-    # Mount the ISO to probe its layout
+    # Mount the ISO to probe its layout and extract kernel/initrd
     mount -o loop,ro "$iso" "$MNT_PROBE" 2>/dev/null || {
         warn "    Could not mount $filename — skipping"
         continue
     }
 
     dtype="$(detect_distro "$MNT_PROBE")"
-    umount "$MNT_PROBE" 2>/dev/null || true
-
     info "    Detected: $dtype"
     ((ISO_COUNT++)) || true
 
+    # Sanitised directory name for extracted kernel + initrd
+    slug="${filename%.iso}"
+    extract_dir="$BOOT_DIR/$slug"
+    mkdir -p "$extract_dir"
+
     case "$dtype" in
         casper)
+            info "    Extracting kernel + initrd (casper)..."
+            cp "$MNT_PROBE/casper/vmlinuz" "$extract_dir/vmlinuz"
+            cp "$MNT_PROBE/casper/initrd"  "$extract_dir/initrd"
             ENTRIES+=("
 menuentry \"$label\" {
-    loopback loop (\$isopart)$isopath
-    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=$isopath quiet splash ---
-    initrd (loop)/casper/initrd
+    linux (\$esppart)/boot/kernels/$slug/vmlinuz boot=casper iso-scan/filename=$isopath quiet splash ---
+    initrd (\$esppart)/boot/kernels/$slug/initrd
 }
 
 menuentry \"$label  (safe graphics)\" {
-    loopback loop (\$isopart)$isopath
-    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=$isopath quiet splash nomodeset ---
-    initrd (loop)/casper/initrd
+    linux (\$esppart)/boot/kernels/$slug/vmlinuz boot=casper iso-scan/filename=$isopath quiet splash nomodeset ---
+    initrd (\$esppart)/boot/kernels/$slug/initrd
 }")
             ;;
         fedora)
+            info "    Extracting kernel + initrd (fedora)..."
+            cp "$MNT_PROBE/images/pxeboot/vmlinuz"   "$extract_dir/vmlinuz"
+            cp "$MNT_PROBE/images/pxeboot/initrd.img" "$extract_dir/initrd"
             ENTRIES+=("
 menuentry \"$label\" {
-    loopback loop (\$isopart)$isopath
-    linux (loop)/images/pxeboot/vmlinuz iso-scan/filename=$isopath rd.live.image quiet
-    initrd (loop)/images/pxeboot/initrd.img
+    linux (\$esppart)/boot/kernels/$slug/vmlinuz iso-scan/filename=$isopath rd.live.image quiet
+    initrd (\$esppart)/boot/kernels/$slug/initrd
 }
 
 menuentry \"$label  (basic graphics)\" {
-    loopback loop (\$isopart)$isopath
-    linux (loop)/images/pxeboot/vmlinuz iso-scan/filename=$isopath rd.live.image nomodeset quiet
-    initrd (loop)/images/pxeboot/initrd.img
+    linux (\$esppart)/boot/kernels/$slug/vmlinuz iso-scan/filename=$isopath rd.live.image nomodeset quiet
+    initrd (\$esppart)/boot/kernels/$slug/initrd
 }")
             ;;
         debian-live)
+            info "    Extracting kernel + initrd (debian-live)..."
+            cp "$MNT_PROBE/live/vmlinuz"    "$extract_dir/vmlinuz"
+            cp "$MNT_PROBE/live/initrd.img" "$extract_dir/initrd"
             ENTRIES+=("
 menuentry \"$label\" {
-    loopback loop (\$isopart)$isopath
-    linux (loop)/live/vmlinuz boot=live findiso=$isopath quiet splash ---
-    initrd (loop)/live/initrd.img
+    linux (\$esppart)/boot/kernels/$slug/vmlinuz boot=live findiso=$isopath quiet splash ---
+    initrd (\$esppart)/boot/kernels/$slug/initrd
 }
 
 menuentry \"$label  (safe graphics)\" {
-    loopback loop (\$isopart)$isopath
-    linux (loop)/live/vmlinuz boot=live findiso=$isopath quiet splash nomodeset ---
-    initrd (loop)/live/initrd.img
+    linux (\$esppart)/boot/kernels/$slug/vmlinuz boot=live findiso=$isopath quiet splash nomodeset ---
+    initrd (\$esppart)/boot/kernels/$slug/initrd
 }")
             ;;
         arch)
+            info "    Extracting kernel + initrd (arch)..."
+            cp "$MNT_PROBE/arch/boot/x86_64/vmlinuz-linux"       "$extract_dir/vmlinuz"
+            cp "$MNT_PROBE/arch/boot/x86_64/initramfs-linux.img" "$extract_dir/initrd"
             ENTRIES+=("
 menuentry \"$label\" {
-    loopback loop (\$isopart)$isopath
-    linux (loop)/arch/boot/x86_64/vmlinuz-linux img_dev=/dev/disk/by-uuid/$ISO_UUID img_loop=$isopath earlymodules=loop
-    initrd (loop)/arch/boot/x86_64/initramfs-linux.img
+    linux (\$esppart)/boot/kernels/$slug/vmlinuz img_dev=/dev/disk/by-uuid/$ISO_UUID img_loop=$isopath earlymodules=loop
+    initrd (\$esppart)/boot/kernels/$slug/initrd
 }
 
 menuentry \"$label  (safe graphics)\" {
-    loopback loop (\$isopart)$isopath
-    linux (loop)/arch/boot/x86_64/vmlinuz-linux img_dev=/dev/disk/by-uuid/$ISO_UUID img_loop=$isopath earlymodules=loop nomodeset
-    initrd (loop)/arch/boot/x86_64/initramfs-linux.img
+    linux (\$esppart)/boot/kernels/$slug/vmlinuz img_dev=/dev/disk/by-uuid/$ISO_UUID img_loop=$isopath earlymodules=loop nomodeset
+    initrd (\$esppart)/boot/kernels/$slug/initrd
 }")
             ;;
         opensuse)
+            info "    Extracting kernel + initrd (opensuse)..."
+            cp "$MNT_PROBE/boot/x86_64/loader/linux"  "$extract_dir/vmlinuz"
+            cp "$MNT_PROBE/boot/x86_64/loader/initrd" "$extract_dir/initrd"
             ENTRIES+=("
 menuentry \"$label\" {
-    loopback loop (\$isopart)$isopath
-    linux (loop)/boot/x86_64/loader/linux iso-scan/filename=$isopath splash=silent quiet
-    initrd (loop)/boot/x86_64/loader/initrd
+    linux (\$esppart)/boot/kernels/$slug/vmlinuz iso-scan/filename=$isopath splash=silent quiet
+    initrd (\$esppart)/boot/kernels/$slug/initrd
 }
 
 menuentry \"$label  (safe graphics)\" {
-    loopback loop (\$isopart)$isopath
-    linux (loop)/boot/x86_64/loader/linux iso-scan/filename=$isopath splash=silent quiet nomodeset
-    initrd (loop)/boot/x86_64/loader/initrd
+    linux (\$esppart)/boot/kernels/$slug/vmlinuz iso-scan/filename=$isopath splash=silent quiet nomodeset
+    initrd (\$esppart)/boot/kernels/$slug/initrd
 }")
             ;;
         *)
-            warn "    Unrecognised ISO layout — adding casper fallback entry"
+            warn "    Unrecognised ISO layout — attempting casper fallback extraction"
+            cp "$MNT_PROBE/casper/vmlinuz" "$extract_dir/vmlinuz" 2>/dev/null || true
+            cp "$MNT_PROBE/casper/initrd"  "$extract_dir/initrd"  2>/dev/null || true
             ENTRIES+=("
 menuentry \"$label  (unrecognised — casper fallback)\" {
-    loopback loop (\$isopart)$isopath
-    linux (loop)/casper/vmlinuz boot=casper iso-scan/filename=$isopath quiet splash ---
-    initrd (loop)/casper/initrd
+    linux (\$esppart)/boot/kernels/$slug/vmlinuz boot=casper iso-scan/filename=$isopath quiet splash ---
+    initrd (\$esppart)/boot/kernels/$slug/initrd
 }")
             ;;
     esac
+
+    umount "$MNT_PROBE" 2>/dev/null || true
 done
 
 info "Found $ISO_COUNT ISO(s)"
@@ -263,12 +305,17 @@ cat > "$GRUB_CFG" <<HEADER
 #
 # No insmod lines — all required modules are built into the signed
 # grubx64.efi binary. Fully Secure Boot compatible.
+#
+# Kernels and initrds are extracted to boot/kernels/<slug>/ on the
+# ESP (FAT32).  Ubuntu's signed GRUB only has FAT/ext2/btrfs/iso9660
+# built in — it CANNOT read the exFAT ISO partition.  The running
+# Linux kernel locates each ISO at boot time via iso-scan/filename.
 
 set timeout=30
 set default=0
 
-# ── Locate the ISO partition by UUID ─────────────────────────────
-search --no-floppy --fs-uuid --set=isopart $ISO_UUID
+# ── Locate the ESP by UUID (FAT32 — always readable by GRUB) ────
+search --no-floppy --fs-uuid --set=esppart $ESP_UUID
 
 HEADER
 

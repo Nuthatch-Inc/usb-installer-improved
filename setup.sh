@@ -3,9 +3,13 @@
 # setup.sh — Prepare a multi-boot USB drive (Option C: Hybrid)
 #
 # Layout:
-#   Partition 1  512 MiB  FAT32   ESP (GRUB2 + shim)
+#   Partition 1  4 GiB    FAT32   ESP (GRUB2 + shim + extracted kernels)
 #   Partition 2  *flex*   exFAT   Linux ISO storage
 #   Partition 3  8 GiB    NTFS    Extracted Windows 11 installer
+#
+# The ESP must be large enough to hold the extracted vmlinuz + initrd
+# for every ISO (~110 MB per ISO). Ubuntu's signed GRUB cannot read
+# exFAT, so kernels are extracted to the FAT32 ESP by update-grub.sh.
 #
 # Usage:
 #   sudo ./setup.sh /dev/sdX [--win-iso path/to/Win11.iso]
@@ -303,7 +307,7 @@ else
 fi
 
 # ── Compute partition sizes ──────────────────────────────────────
-ESP_SIZE_MIB=512
+ESP_SIZE_MIB=4096  # 4 GiB — holds GRUB + extracted kernels/initrds (~110 MB per ISO)
 WIN_SIZE_MIB=8192  # 8 GiB — enough for any Windows 11 ISO
 
 # ── Save existing partition device paths before wiping ───────────

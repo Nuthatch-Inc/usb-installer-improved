@@ -10,9 +10,9 @@ A multi-boot USB drive creator built on GRUB2 — no Ventoy, no opaque binaries.
 | Linux ISOs (~110 GB) | exFAT | Drop-in `.iso` files |
 | Windows 11 (8 GB) | NTFS | Extracted Windows installer |
 
-- Linux distros boot via GRUB's `loopback` — the `update-grub.sh` script mounts each ISO, detects the distro family, and writes a static menu with the correct kernel parameters.
+- Linux distros: `update-grub.sh` mounts each ISO, detects the distro family, **extracts the kernel + initrd** to `boot/kernels/<slug>/` on the ESP, and writes a static GRUB menu. Kernels must live on the ESP (FAT32) because Ubuntu's signed GRUB only has FAT/ext2/btrfs/iso9660 built in — it **cannot read the exFAT** ISO partition. The running Linux kernel has its own exFAT driver and locates the ISO at boot time via `iso-scan/filename` or equivalent kernel parameters.
 - Windows chainloads its native boot manager from a real NTFS partition.
-- **Fully Secure Boot compatible** — zero `insmod` lines. Ubuntu's signed `grubx64.efi` has all required modules (loopback, iso9660, linux, chain, search, regexp, etc.) built in.
+- **Fully Secure Boot compatible** — zero `insmod` lines. Ubuntu's signed `grubx64.efi` has all required modules built in. Kernels are loaded from the ESP (FAT32), which GRUB can always read; ISO files stay on the exFAT partition where only the Linux kernel needs to access them.
 
 ## Quick start
 
