@@ -125,16 +125,35 @@ while IFS= read -r part_dev; do
         iso9660)
             ISO_PARTS+=("$part_dev")
             ;;
+        udf)
+            # Some ISOs use UDF — treat as ISO
+            ISO_PARTS+=("$part_dev")
+            ;;
+        vfat)
+            # FAT32 partition — check if it's a Windows installer
+            # (by partition label or by presence of Windows boot files)
+            if [[ "$partlabel" == *indows* || "$partlabel" == "WIN11" ]]; then
+                WIN_PARTS+=("$part_dev")
+            else
+                # Mount and probe for Windows files
+                if mount -o ro "$part_dev" "$MNT_PROBE" 2>/dev/null; then
+                    if [[ -d "$MNT_PROBE/sources" && -f "$MNT_PROBE/efi/boot/bootx64.efi" ]]; then
+                        WIN_PARTS+=("$part_dev")
+                    else
+                        warn "  Skipping $part_dev (FAT32, label=$partlabel, not Windows)"
+                    fi
+                    umount "$MNT_PROBE" 2>/dev/null || true
+                else
+                    warn "  Skipping $part_dev (fstype=$fstype, label=$partlabel)"
+                fi
+            fi
+            ;;
         ntfs)
+            # Legacy: NTFS Windows partitions from older setups
             WIN_PARTS+=("$part_dev")
             ;;
         *)
-            if [[ "$fstype" == "udf" ]]; then
-                # Some ISOs use UDF — treat as ISO
-                ISO_PARTS+=("$part_dev")
-            else
-                warn "  Skipping $part_dev (fstype=$fstype, label=$partlabel)"
-            fi
+            warn "  Skipping $part_dev (fstype=$fstype, label=$partlabel)"
             ;;
     esac
 done < <(lsblk -rno NAME "$DEVICE" 2>/dev/null | tail -n +2 | awk '{print "/dev/" $1}')

@@ -5,7 +5,7 @@
 # Layout:
 #   Partition 1        512 MiB  FAT32      ESP (shim + GRUB + grub.cfg)
 #   Partition 2..N     *auto*   ISO9660    Raw dd'd Linux ISOs
-#   Partition N+1      8 GiB    NTFS       Extracted Windows 11 (optional)
+#   Partition N+1      8 GiB    FAT32      Extracted Windows 11 (optional)
 #
 # Each Linux ISO is written raw (dd) into its own GPT partition.
 # The ISO9660 filesystem becomes directly readable by GRUB (which has
@@ -32,7 +32,7 @@
 #              grub-install --force if efi/ is not populated.
 #
 # Dependencies are auto-installed for supported distros.
-# Manual installs need: sgdisk, mkfs.fat, mkfs.ntfs (ntfs-3g),
+# Manual installs need: sgdisk, mkfs.fat, wimlib-imagex (wimtools/wimlib-utils),
 #                        7z or bsdtar (Windows only), partprobe (parted)
 
 set -euo pipefail
@@ -62,7 +62,7 @@ Usage: sudo $0 /dev/sdX --iso path/to/linux.iso [--iso another.iso ...] [--win-i
 
 Options:
   --iso PATH       Add a Linux ISO (can be repeated)
-  --win-iso PATH   Add a Windows 11 ISO (extracted to NTFS partition)
+  --win-iso PATH   Add a Windows 11 ISO (extracted to FAT32 partition, large .wim files auto-split)
   -h, --help       Show this help
 
 Example:
@@ -122,7 +122,7 @@ for iso in "${LINUX_ISOS[@]}"; do
     ((PART_NUM++))
 done
 if [[ -n "$WIN_ISO" ]]; then
-    info "  Partition $PART_NUM:  8192 MiB  NTFS  Windows 11"
+    info "  Partition $PART_NUM:  8192 MiB  FAT32  Windows 11"
     TOTAL_MIB=$(( TOTAL_MIB + 8192 ))
 fi
 info "  Total used: ~$(( TOTAL_MIB / 1024 )) GiB of ${DEVICE_SIZE_GIB} GiB"
@@ -191,43 +191,43 @@ install_deps() {
     case "$distro" in
         ubuntu|debian|linuxmint|pop|elementary|zorin|kali|neon)
             base_pkgs=(gdisk dosfstools parted util-linux grub-efi-amd64-bin)
-            win_pkgs=(ntfs-3g p7zip-full)
+            win_pkgs=(wimtools p7zip-full)
             PKGMGR="apt"
             ;;
         fedora)
             base_pkgs=(gdisk dosfstools parted util-linux grub2-efi-x64 grub2-efi-x64-modules)
-            win_pkgs=(ntfs-3g p7zip p7zip-plugins)
+            win_pkgs=(wimlib-utils p7zip p7zip-plugins)
             PKGMGR="dnf"
             ;;
         rhel|centos|rocky|alma|ol)
             base_pkgs=(gdisk dosfstools parted util-linux grub2-efi-x64 grub2-efi-x64-modules)
-            win_pkgs=(ntfs-3g p7zip p7zip-plugins)
+            win_pkgs=(wimlib-utils p7zip p7zip-plugins)
             PKGMGR="dnf"
             ;;
         opensuse*|suse|sles)
             base_pkgs=(gptfdisk dosfstools parted util-linux grub2-x86_64-efi)
-            win_pkgs=(ntfs-3g p7zip)
+            win_pkgs=(wimlib-utils p7zip)
             PKGMGR="zypper"
             ;;
         arch|manjaro|endeavouros|garuda|cachyos)
             base_pkgs=(gptfdisk dosfstools parted util-linux grub)
-            win_pkgs=(ntfs-3g p7zip)
+            win_pkgs=(wimlib p7zip)
             PKGMGR="pacman"
             ;;
         void)
             base_pkgs=(gptfdisk dosfstools parted util-linux grub-x86_64-efi)
-            win_pkgs=(ntfs-3g p7zip)
+            win_pkgs=(wimlib p7zip)
             PKGMGR="xbps"
             ;;
         alpine)
             base_pkgs=(gptfdisk dosfstools parted util-linux grub-efi)
-            win_pkgs=(ntfs-3g-progs p7zip)
+            win_pkgs=(wimlib p7zip)
             PKGMGR="apk"
             ;;
         *)
             warn "Unrecognised distro '$distro' — skipping automatic dependency install."
             warn "Please ensure: sgdisk mkfs.fat wipefs lsblk partprobe blkid dd"
-            [[ -n "$WIN_ISO" ]] && warn "For Windows: mkfs.ntfs, 7z or bsdtar"
+            [[ -n "$WIN_ISO" ]] && warn "For Windows: wimlib-imagex, 7z or bsdtar"
             return 0
             ;;
     esac
@@ -255,7 +255,7 @@ for cmd in sgdisk mkfs.fat wipefs lsblk partprobe blkid dd; do
 done
 
 if [[ -n "$WIN_ISO" ]]; then
-    command -v mkfs.ntfs >/dev/null || die "mkfs.ntfs not found (install ntfs-3g)"
+    command -v wimlib-imagex >/dev/null || die "wimlib-imagex not found (install wimtools or wimlib-utils)"
     if command -v 7z >/dev/null; then
         EXTRACT_CMD="7z"
     elif command -v bsdtar >/dev/null; then
@@ -401,11 +401,14 @@ for part_num in $(echo "${!ISO_PARTMAP[@]}" | tr ' ' '\n' | sort -n); do
 done
 
 # ── Format and extract Windows ───────────────────────────────────
+# Windows partition is FAT32 so both GRUB and UEFI firmware can read it.
+# Any .wim files exceeding FAT32's 4 GB limit are split with wimlib,
+# exactly like Microsoft's Media Creation Tool does.
 MNT_WIN=""
 if [[ -n "$WIN_ISO" && -n "$WIN_PART_NUM" ]]; then
     win_dev="${PART_PREFIX}${WIN_PART_NUM}"
-    info "Formatting Windows partition (NTFS)..."
-    mkfs.ntfs -f -L "WIN11" "$win_dev"
+    info "Formatting Windows partition (FAT32)..."
+    mkfs.fat -F32 -n "WIN11" "$win_dev"
 
     MNT_WIN=$(mktemp -d)
     mount "$win_dev" "$MNT_WIN"
@@ -415,6 +418,24 @@ if [[ -n "$WIN_ISO" && -n "$WIN_PART_NUM" ]]; then
         7z)     7z x "$WIN_ISO" -o"$MNT_WIN" -bso0 -bsp1 ;;
         bsdtar) bsdtar xf "$WIN_ISO" -C "$MNT_WIN" ;;
     esac
+
+    # Split any .wim files that exceed FAT32's 4 GB file size limit.
+    # Windows Setup natively understands .swm (split WIM) files.
+    # This is the same approach Microsoft's Media Creation Tool uses.
+    FAT32_MAX=4294967295  # 4 GiB - 1 byte
+    while IFS= read -r -d '' wim_file; do
+        wim_size=$(stat -c%s "$wim_file")
+        if (( wim_size > FAT32_MAX )); then
+            wim_name="$(basename "$wim_file")"
+            swm_name="${wim_name%.wim}.swm"
+            swm_dir="$(dirname "$wim_file")"
+            info "  Splitting $wim_name ($(( wim_size / 1048576 )) MiB) into .swm chunks..."
+            wimlib-imagex split "$wim_file" "$swm_dir/$swm_name" 3800
+            rm -f "$wim_file"
+            info "  ✓ $wim_name split into .swm files"
+        fi
+    done < <(find "$MNT_WIN" -name '*.wim' -print0 2>/dev/null)
+
     info "  ✓ Windows extraction complete"
 fi
 

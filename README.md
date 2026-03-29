@@ -10,7 +10,7 @@ Each Linux ISO gets its own GPT partition, written raw with `dd`. GRUB reads the
 |-----------|--------|----------|
 | 1 (ESP) | FAT32 (512 MB) | GRUB2 EFI bootloader + config |
 | 2..N | ISO9660 (auto-sized) | One raw Linux ISO per partition |
-| N+1 (optional) | NTFS (8 GB) | Extracted Windows 11 installer |
+| N+1 (optional) | FAT32 (8 GB) | Extracted Windows 11 installer (large `.wim` files auto-split) |
 
 ### Why partition-per-ISO?
 
@@ -72,7 +72,7 @@ Run this if the menu gets out of sync, or after manual partition changes.
 
 Unrecognised ISOs get a casper-based fallback entry.
 
-**Windows 11** is extracted to an NTFS partition (UEFI firmware can read FAT for the Windows bootloader, and the installer handles the rest).
+**Windows 11** is extracted to a FAT32 partition. Any `.wim` files exceeding FAT32's 4 GB limit are automatically split into `.swm` chunks using `wimlib` — the same approach Microsoft's own Media Creation Tool uses. GRUB chainloads the Windows boot manager directly, and Windows Setup natively reassembles the split images during installation.
 
 ## Requirements
 
@@ -80,7 +80,7 @@ Unrecognised ISOs get a casper-based fallback entry.
 - A USB flash drive (128 GB recommended for multiple ISOs)
 - `sgdisk`, `mkfs.fat`, `blkid`, `dd` (from `util-linux` and `gdisk`)
 - `7z` or `bsdtar` (only for Windows ISO extraction)
-- `mkfs.ntfs` from `ntfs-3g` (only for Windows)
+- `wimlib-imagex` from `wimtools` / `wimlib-utils` (only for Windows, to split large `.wim` files)
 
 Dependencies are auto-installed by `setup.sh` for most distros. On Fedora:
 
